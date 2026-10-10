@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from functools import wraps
-import logging
 from typing import Any, Generic, TypeVar
 
 from homeassistant.components import websocket_api
@@ -16,6 +16,7 @@ from homeassistant.components.camera import (
 )
 from homeassistant.components.camera.helper import get_camera_from_entity_id
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from webrtc_models import RTCIceCandidateInit
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,15 +89,11 @@ class SimpliSafeWebRTCSession(ABC):
 		"""Close the session."""
 
 
-async def async_register_webrtc_client_config_handler(
-	hass: HomeAssistant, _component: str
-) -> None:
+async def async_register_webrtc_client_config_handler(hass: HomeAssistant, _component: str) -> None:
 	"""Replace a registered Home Assistant websocket handler with a wrapped one."""
 	command = "camera/webrtc/get_client_config"
 
-	if (
-		handlers := hass.data.get(websocket_api.DOMAIN)
-	) is None or command not in handlers:
+	if (handlers := hass.data.get(websocket_api.DOMAIN)) is None or command not in handlers:
 		_LOGGER.warning("Cannot wrap missing Home Assistant websocket command %s", command)
 		return
 
@@ -120,7 +117,11 @@ async def async_register_webrtc_client_config_handler(
 		if async_prepare_config := getattr(
 			camera, "async_prepare_webrtc_client_configuration", None
 		):
-			config = await async_prepare_config()
+			try:
+				config = await async_prepare_config()
+			except HomeAssistantError as err:
+				connection.send_error(msg["id"], "webrtc_get_client_config_failed", str(err))
+				return
 
 		token = _webrtc_client_configuration.set(config)
 		try:

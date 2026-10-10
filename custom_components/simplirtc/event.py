@@ -4,20 +4,19 @@ from __future__ import annotations
 
 from typing import cast, override
 
-from simplipy.device.camera import Camera
-from simplipy.system.v3 import SystemV3
-from simplipy.websocket import EVENT_CAMERA_MOTION_DETECTED, WebsocketEvent
-
 from homeassistant.components.event import (
 	EventDeviceClass,
 	EventEntity,
 	EventEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from simplipy.device.camera import Camera
+from simplipy.system.v3 import SystemV3
+from simplipy.websocket import EVENT_CAMERA_MOTION_DETECTED, WebsocketEvent
 
 EVENT_TYPE_MOTION = "motion"
 CAMERA_EVENT_SERIAL_KEYS = ("uuid", "serial")

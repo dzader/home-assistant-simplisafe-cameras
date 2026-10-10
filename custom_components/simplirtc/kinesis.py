@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from abc import ABC
 import asyncio
 import base64
-from collections.abc import Callable
-from dataclasses import asdict
 import json
 import logging
+from abc import ABC
+from collections.abc import Callable
+from dataclasses import asdict
 from secrets import token_hex
 from typing import Any, override
 
@@ -87,14 +87,12 @@ class KinesisSession(SimpliSafeWebRTCSession):
 			try:
 				await self._read()
 			except Exception as err:
-				self._logger.error("Error in Kinesis session: %s", err)
+				self._logger.error("Kinesis signaling failed (%s)", type(err).__name__)
 			finally:
 				self._reader_task = None
 				self.close()
 
-		self._reader_task = asyncio.create_task(
-			reader_task(), name=f"simplirtc-kinesis-{self._id}"
-		)
+		self._reader_task = asyncio.create_task(reader_task(), name=f"simplirtc-kinesis-{self._id}")
 
 	@override
 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
@@ -146,21 +144,20 @@ class KinesisSession(SimpliSafeWebRTCSession):
 			ClientSession() as session,
 			session.ws_connect(self._channel_endpoint) as ws,
 		):
+
 			async def send_request(request: KinesisRequest) -> None:
-				self._logger.debug("-> %s", request)
+				self._logger.debug("Sending Kinesis message kind=%s", request.action)
 				await ws.send_json(asdict(request))
 
 			await self._request_queue.flush(send_request)
 			async for msg in ws:
-				self._logger.debug("<- %s", msg.data)
-
 				if msg.data == "":
 					continue  # Ignore empty messages
 
 				try:
 					parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
 				except Exception:
-					self._logger.exception("failed to parse message")
+					self._logger.warning("Failed to parse Kinesis signaling message")
 					continue
 
 				payload = parsed.payload
@@ -170,10 +167,14 @@ class KinesisSession(SimpliSafeWebRTCSession):
 					case "SDP_ANSWER":
 						send_message(WebRTCAnswer(answer=payload["sdp"]))
 					case "ICE_CANDIDATE":
-						send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
-							candidate=payload.get("candidate", ""),
-							sdp_mid=payload.get("sdpMid"),
-							sdp_m_line_index=payload.get("sdpMLineIndex"),
-						)))
+						send_message(
+							WebRTCCandidate(
+								candidate=RTCIceCandidateInit(
+									candidate=payload.get("candidate", ""),
+									sdp_mid=payload.get("sdpMid"),
+									sdp_m_line_index=payload.get("sdpMLineIndex"),
+								)
+							)
+						)
 					case _:
 						continue

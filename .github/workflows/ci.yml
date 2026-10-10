@@ -1,0 +1,47 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tools-and-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements-test.txt
+      - run: python -m pytest tests/tools -q --confcutdir=tests/tools
+      - run: node --test frontend/tests/simplisafe-camera-live.test.cjs
+      - run: node --check frontend/simplisafe-camera-live.js
+      - run: python tools/build_release.py
+      - run: git diff --check
+
+  home-assistant:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['2026.6.4', '2026.10.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install test and runtime dependencies
+        env:
+          HA_VERSION: ${{ matrix.version }}
+        run: |
+          python -m pip install "homeassistant==$HA_VERSION" -r requirements-test.txt
+          python -c "import json,pathlib; p=pathlib.Path('custom_components/simplirtc/manifest.json'); pathlib.Path('runtime-requirements.txt').write_text('\n'.join(json.loads(p.read_text())['requirements'])+'\n')"
+          python -m pip install -r runtime-requirements.txt
+      - run: python -m pytest tests --ignore=tests/tools -q

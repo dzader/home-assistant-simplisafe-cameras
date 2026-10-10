@@ -1,4 +1,5 @@
 {
-  "name": "Simplirtc",
-  "render_readme": false
+  "name": "SimpliSafe Camera Streaming",
+  "homeassistant": "2026.6.4",
+  "render_readme": true
 }

@@ -1,0 +1,970 @@
+diff --git a/docs/camera.md b/docs/camera.md
+index 0ce59d0ce1a7675de84193c34c34cc175fabf7da..715762767f37c6afd503a4615e3422f3f93e73d8 100644
+--- a/docs/camera.md
++++ b/docs/camera.md
+@@ -10,7 +10,7 @@ All {meth}`Camera <simplipy.camera.Camera>` objects come with a standard set of
+ 
+ ```python
+ for serial, camera in system.cameras.items():
+-    # Return the cammera's UUID:
++    # Return the camera's UUID:
+     serial
+     # >>> 1234ABCD
+ 
+@@ -54,9 +54,81 @@ for serial, camera in system.cameras.items():
+     # >>> True
+ ```
+ 
+-## Getting the Camera Video URL
++## Discovering the Stream Transport
++
++`camera.uuid` identifies the camera in the media APIs. For compatibility,
++`camera.serial` returns that same UUID, which can differ from a hardware serial
++in the subscription response. Select the streaming transport using
++`camera.stream_provider`, rather than inferring it from a model name:
++
++| Provider | Transport | Required consumer |
++| --- | --- | --- |
++| `CameraStreamProvider.LEGACY` | Authenticated FLV over HTTPS | Media player or relay supporting HTTP headers |
++| `CameraStreamProvider.KVS` | AWS Kinesis WebRTC | Kinesis signaling adapter and WebRTC peer |
++| `CameraStreamProvider.MIST` | LiveKit WebRTC | LiveKit signaling adapter and WebRTC peer |
++| `CameraStreamProvider.UNKNOWN` | An unrecognized provider | Unsupported until its protocol is implemented |
++
++The raw `camera.webrtc_provider` is the value of
++`cameraSettings.admin.webRTCProvider`. An absent value or `simplisafe` selects
++legacy FLV; `kvs` selects Kinesis; `mist` selects LiveKit. The older
++`supportedFeatures.providers.webrtc` value can be `none` on a working legacy
++camera.
++
++## Getting Fresh Live-View Credentials
++
++```python
++from simplipy.device.live_view import (
++    KinesisLiveView,
++    LegacyLiveView,
++    LiveKitLiveView,
++)
++
++# Call once for each new viewer session. Do not save or log this object.
++live_view = await camera.async_get_live_view(width=1280)
++
++if isinstance(live_view, LegacyLiveView):
++    # Pass BOTH values to your media relay. A URL alone is unauthenticated.
++    source_url = live_view.url
++    source_headers = live_view.headers
++elif isinstance(live_view, KinesisLiveView):
++    # Pass these to a Kinesis signaling adapter, then negotiate WebRTC.
++    signaling_url = live_view.signed_channel_endpoint
++    client_id = live_view.client_id
++    ice_servers = live_view.ice_servers
++elif isinstance(live_view, LiveKitLiveView):
++    # Join through a LiveKit signaling adapter, then subscribe to the camera.
++    service_url = live_view.livekit_url
++    participant_token = live_view.user_token
++```
++
++Kinesis and LiveKit credentials are fetched from
++`https://app-hub.prd.aser.simplisafe.com/v2/cameras/{uuid}/{sid}/live-view` using the
++authenticated API's retry and token refresh policy. Legacy FLV uses
++`Authorization: Bearer ...` as an HTTP header. It checks authentication before
++returning the current bearer token. Tokens are never appended to the FLV URL.
++The library does not cache live-view credentials and deliberately omits them
++from object representations and API debug payload logs.
++
++These are temporary credentials, not permanent RTSP/HLS URLs. Their exact
++lifetime is not exposed by the documented response contracts, so callers must
++request a new session whenever they start or reconnect a viewer. The library
++validates response structure but does not connect to the media transport,
++relay video, or negotiate WebRTC itself. A sleeping or unavailable camera can
++return incomplete session details; in that case `LiveViewError` is raised
++rather than returning unusable credentials.
++
++The transport contracts are based on public implementations in
++[hass-simplirtc](https://github.com/gilliginsisland/hass-simplirtc) and
++[homebridge-simplisafe3](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3).
++Synthetic tests cover discovery, response validation, auth refresh, and secret
++handling. They do not establish playback on a physical camera or account.
++
++## Getting the Legacy Camera Video URL
+ 
+ ```python
+ url = camera.video_url()
+ # >>> https://media.simplisafe.com/v1/...
+ ```
++
++`video_url()` remains available for existing clients. It only constructs a URL;
++use `async_get_live_view()` to obtain the authentication header as well.
+diff --git a/simplipy/api.py b/simplipy/api.py
+index 43b884acb8c85c24d7612796aff9fad2b66bbdae..a7b0c52eae2ca8cd073ed0555d9228b3a201c3e1 100644
+--- a/simplipy/api.py
++++ b/simplipy/api.py
+@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
+ from datetime import datetime
+ from json.decoder import JSONDecodeError
+ from typing import Any, cast
++from urllib.parse import urlsplit
+ 
+ import backoff
+ from aiohttp import ClientSession
+@@ -205,7 +206,13 @@ class API:  # pylint: disable=too-many-instance-attributes
+         self.websocket = WebsocketClient(self)
+ 
+     async def _async_api_request(
+-        self, method: str, endpoint: str, url_base: str = API_URL_BASE, **kwargs: Any
++        self,
++        method: str,
++        endpoint: str,
++        url_base: str = API_URL_BASE,
++        *,
++        sensitive_response: bool = False,
++        **kwargs: Any,
+     ) -> dict[str, Any]:
+         """Make an API request.
+ 
+@@ -213,13 +220,19 @@ class API:  # pylint: disable=too-many-instance-attributes
+             method: An HTTP method.
+             endpoint: A relative API endpoint.
+             url_base: The base URL of the API.
++            sensitive_response: Whether to omit the payload from debug logs.
+             **kwargs: Additional kwargs to send with the request.
+ 
+         Returns:
+             An API response payload.
+         """
++        sensitive_response = (
++            sensitive_response
++            or endpoint == "oauth/token"
++            or endpoint.endswith("/live-view")
++        )
+         kwargs.setdefault("headers", {})
+-        kwargs["headers"].setdefault("Host", API_URL_HOSTNAME)
++        kwargs["headers"].setdefault("Host", urlsplit(url_base).netloc)
+         kwargs["headers"]["Content-Type"] = "application/json; charset=utf-8"
+         kwargs["headers"]["User-Agent"] = DEFAULT_USER_AGENT
+         if self.access_token:
+@@ -231,7 +244,7 @@ class API:  # pylint: disable=too-many-instance-attributes
+                 **API_COOKIE_OVERRIDES,
+             }
+ 
+-        data: dict[str, Any] | str = {}
++        data: Any = {}
+         async with self.session.request(
+             method, f"{url_base}/{endpoint}", **kwargs
+         ) as resp:
+@@ -252,7 +265,17 @@ class API:  # pylint: disable=too-many-instance-attributes
+                 message = data.replace('"', "")
+                 data = {"error": message}
+ 
+-            LOGGER.debug("Data received from /%s: %s", endpoint, data)
++            if sensitive_response:
++                LOGGER.debug("Response received from /%s (payload omitted)", endpoint)
++            else:
++                LOGGER.debug("Data received from /%s: %s", endpoint, data)
++
++            # Command endpoints can acknowledge success with an empty body.
++            # Credential endpoints require an object and must reject null.
++            if data is None and not sensitive_response:
++                data = {}
++            if not isinstance(data, dict):
++                raise RequestError("Expected a JSON object from the API")
+ 
+             raise_on_data_error(data)
+             resp.raise_for_status()
+diff --git a/simplipy/device/camera.py b/simplipy/device/camera.py
+index 56b790d1f9c476bf6db806141151246fe17240d1..592726721558e1fc11947fa2b5a28f50903adf94 100644
+--- a/simplipy/device/camera.py
++++ b/simplipy/device/camera.py
+@@ -2,12 +2,21 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Mapping
+ from enum import Enum
++from types import MappingProxyType
+ from typing import TYPE_CHECKING, Any, cast
+-from urllib.parse import urlencode
++from urllib.parse import quote, urlencode
+ 
+ from simplipy.const import LOGGER
+ from simplipy.device import DeviceV3
++from simplipy.device.live_view import (
++    CameraLiveView,
++    CameraStreamProvider,
++    LegacyLiveView,
++    parse_live_view_response,
++)
++from simplipy.errors import InvalidCredentialsError, UnsupportedStreamProviderError
+ 
+ if TYPE_CHECKING:
+     from simplipy.system.v3 import SystemV3
+@@ -15,6 +24,7 @@ if TYPE_CHECKING:
+ DEFAULT_AUDIO_ENCODING = "AAC"
+ DEFAULT_MEDIA_URL_BASE = "https://media.simplisafe.com/v1"
+ DEFAULT_VIDEO_WIDTH = 1280
++WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+ 
+ 
+ class CameraTypes(Enum):
+@@ -86,6 +96,99 @@ class Camera(DeviceV3):
+         """
+         return self._serial
+ 
++    @property
++    def uuid(self) -> str:
++        """Return the camera UUID used by media and app-hub endpoints.
++
++        The historic ``serial`` property also contains this UUID. A hardware
++        serial in the subscription payload can be a different identifier.
++
++        Returns:
++            The camera UUID.
++        """
++        return self._serial
++
++    @property
++    def webrtc_provider(self) -> str | None:
++        """Return the camera's advertised WebRTC provider.
++
++        Returns:
++            The raw provider name, or None when none is advertised.
++        """
++        admin = self.camera_settings.get("admin")
++        if not isinstance(admin, Mapping):
++            return None
++        provider = admin.get("webRTCProvider")
++        return provider if isinstance(provider, str) and provider else None
++
++    @property
++    def stream_provider(self) -> CameraStreamProvider:
++        """Return the live-view transport selected by the camera settings.
++
++        Returns:
++            A known transport, or UNKNOWN for a new provider.
++        """
++        admin = self.camera_settings.get("admin")
++        if isinstance(admin, Mapping):
++            raw_provider = admin.get("webRTCProvider")
++            if raw_provider is not None and not isinstance(raw_provider, str):
++                return CameraStreamProvider.UNKNOWN
++        provider = self.webrtc_provider
++        if provider is None or provider == "simplisafe":
++            return CameraStreamProvider.LEGACY
++        try:
++            return CameraStreamProvider(provider)
++        except ValueError:
++            return CameraStreamProvider.UNKNOWN
++
++    async def async_get_live_view(
++        self,
++        width: int = DEFAULT_VIDEO_WIDTH,
++        audio_encoding: str = DEFAULT_AUDIO_ENCODING,
++    ) -> CameraLiveView:
++        """Fetch fresh credentials for one camera viewing session.
++
++        Kinesis and LiveKit use the app-hub API, with the normal API token
++        refresh/retry policy. Legacy FLV uses a bearer header, never a token
++        query parameter. This method does not cache sessions or open a stream.
++
++        Args:
++            width: The video width for legacy FLV cameras.
++            audio_encoding: The audio encoding for legacy FLV cameras.
++
++        Returns:
++            A typed provider response containing transient credentials.
++
++        Raises:
++            InvalidCredentialsError: If no authenticated token is available.
++            UnsupportedStreamProviderError: If the provider is unsupported.
++            LiveViewError: If the live-view response is incomplete or malformed.
++            RequestError: If an API request fails.
++        """
++        provider = self.stream_provider
++        if provider == CameraStreamProvider.UNKNOWN:
++            raise UnsupportedStreamProviderError("Unsupported camera stream provider")
++        api = self._system._api  # pylint: disable=protected-access
++        if provider == CameraStreamProvider.LEGACY:
++            # authCheck is read-only and goes through the refresh/retry wrapper;
++            # obtain the current bearer after a possible expired-token refresh.
++            await api.async_request("get", "api/authCheck", sensitive_response=True)
++            if not api.access_token:
++                raise InvalidCredentialsError("No authenticated camera access token")
++            return LegacyLiveView(
++                url=self.video_url(width=width, audio_encoding=audio_encoding),
++                headers=MappingProxyType(
++                    {"Authorization": f"Bearer {api.access_token}"}
++                ),
++            )
++        data = await api.async_request(
++            "get",
++            f"cameras/{quote(self.uuid, safe='')}/{self._system.system_id}/live-view",
++            url_base=WEBRTC_URL_BASE,
++            sensitive_response=True,
++        )
++        return parse_live_view_response(provider, data)
++
+     @property
+     def shutter_open_when_away(self) -> bool:
+         """Return whether the privacy shutter is open in away mode.
+diff --git a/simplipy/errors.py b/simplipy/errors.py
+index 6ccfed84111040d2871fa8e4361a7d9d1be203c5..0d0a7bc89f180b497b0e39eeaa4efbbeaa562b66 100644
+--- a/simplipy/errors.py
++++ b/simplipy/errors.py
+@@ -41,6 +41,18 @@ class RequestError(SimplipyError):
+     pass
+ 
+ 
++class LiveViewError(RequestError):
++    """An error related to invalid or unavailable camera live-view data."""
++
++    pass
++
++
++class UnsupportedStreamProviderError(LiveViewError):
++    """An error related to a camera with an unsupported stream provider."""
++
++    pass
++
++
+ class WebsocketError(SimplipyError):
+     """An error related to generic websocket errors."""
+ 
+diff --git a/simplipy/device/live_view.py b/simplipy/device/live_view.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffc9e3188d14c106825cfa4b7bb10e4beb0b9c7c
+--- /dev/null
++++ b/simplipy/device/live_view.py
+@@ -0,0 +1,178 @@
++"""Define short-lived camera live-view credentials and response validation.
++
++These objects describe transports; they do not open or relay a media stream.
++Fetch a new object for each viewing session and do not persist credentials.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any
++from urllib.parse import urlsplit
++
++from simplipy.errors import LiveViewError
++
++
++class CameraStreamProvider(Enum):
++    """Define camera live-view transports independently of the camera model."""
++
++    LEGACY = "simplisafe"
++    KVS = "kvs"
++    MIST = "mist"
++    UNKNOWN = "unknown"
++
++
++@dataclass(frozen=True)
++class LegacyLiveView:
++    """An authenticated FLV request, requiring a media player or relay.
++
++    Args:
++        url: The FLV media URL.
++        headers: The headers required to authenticate the media request.
++    """
++
++    url: str = field(repr=False)
++    headers: Mapping[str, str] = field(repr=False)
++    provider: CameraStreamProvider = field(
++        default=CameraStreamProvider.LEGACY, init=False
++    )
++
++
++@dataclass(frozen=True)
++class KinesisIceServer:
++    """An ICE server returned with a Kinesis signaling session.
++
++    Args:
++        urls: STUN or TURN server URLs.
++        username: Optional temporary TURN username.
++        credential: Optional temporary TURN password.
++    """
++
++    urls: tuple[str, ...]
++    username: str | None = field(default=None, repr=False)
++    credential: str | None = field(default=None, repr=False)
++
++
++@dataclass(frozen=True)
++class KinesisLiveView:
++    """A Kinesis WebRTC signaling session, requiring a signaling adapter.
++
++    Args:
++        signed_channel_endpoint: The temporary signed signaling WebSocket URL.
++        client_id: The viewer client identifier.
++        ice_servers: The ICE servers for this session.
++    """
++
++    signed_channel_endpoint: str = field(repr=False)
++    client_id: str
++    ice_servers: tuple[KinesisIceServer, ...]
++    provider: CameraStreamProvider = field(default=CameraStreamProvider.KVS, init=False)
++
++
++@dataclass(frozen=True)
++class LiveKitLiveView:
++    """A LiveKit room session, requiring a LiveKit signaling adapter.
++
++    Args:
++        livekit_url: The LiveKit service URL.
++        user_token: The temporary participant token.
++    """
++
++    livekit_url: str = field(repr=False)
++    user_token: str = field(repr=False)
++    provider: CameraStreamProvider = field(
++        default=CameraStreamProvider.MIST, init=False
++    )
++
++
++CameraLiveView = LegacyLiveView | KinesisLiveView | LiveKitLiveView
++
++
++def _required_string(data: Mapping[str, Any], key: str) -> str:
++    """Read a required string without including the response in errors."""
++    value = data.get(key)
++    if not isinstance(value, str) or not value.strip():
++        raise LiveViewError(f"Live-view response is missing a valid {key}")
++    if any(character in value for character in ("\r", "\n", "\x00")):
++        raise LiveViewError(f"Live-view response contains an invalid {key}")
++    return value
++
++
++def _required_url(data: Mapping[str, Any], key: str, schemes: set[str]) -> str:
++    """Read a secure transport URL without logging its signed query."""
++    value = _required_string(data, key)
++    try:
++        parsed = urlsplit(value)
++        valid = parsed.scheme in schemes and bool(parsed.hostname)
++    except ValueError as err:
++        raise LiveViewError(f"Live-view response contains an invalid {key}") from err
++    if not valid:
++        raise LiveViewError(f"Live-view response contains an invalid {key}")
++    return value
++
++
++def _parse_ice_server(data: Any) -> KinesisIceServer:
++    """Validate an ICE server, retaining credentials only in hidden fields."""
++    if not isinstance(data, Mapping):
++        raise LiveViewError("Live-view response contains an invalid ICE server")
++    urls = data.get("urls")
++    if isinstance(urls, str):
++        urls = [urls]
++    if not isinstance(urls, list) or not urls:
++        raise LiveViewError("Live-view response contains invalid ICE URLs")
++    for url in urls:
++        if (
++            not isinstance(url, str)
++            or not url.partition(":")[2]
++            or url.partition(":")[0] not in {"stun", "stuns", "turn", "turns"}
++            or any(character in url for character in ("\r", "\n", "\x00"))
++        ):
++            raise LiveViewError("Live-view response contains invalid ICE URLs")
++    username = data.get("username")
++    credential = data.get("credential")
++    if username is not None and not isinstance(username, str):
++        raise LiveViewError("Live-view response contains an invalid ICE username")
++    if credential is not None and not isinstance(credential, str):
++        raise LiveViewError("Live-view response contains an invalid ICE credential")
++    return KinesisIceServer(tuple(urls), username, credential)
++
++
++def parse_live_view_response(
++    provider: CameraStreamProvider, data: Mapping[str, Any]
++) -> KinesisLiveView | LiveKitLiveView:
++    """Validate a provider-specific live-view response.
++
++    Args:
++        provider: The camera's known WebRTC provider.
++        data: The response from the app-hub live-view endpoint.
++
++    Returns:
++        Fresh credentials for the selected WebRTC transport.
++
++    Raises:
++        LiveViewError: If the provider response is incomplete or malformed.
++    """
++    if not isinstance(data, Mapping):
++        raise LiveViewError("Expected a JSON object in the live-view response")
++    if provider == CameraStreamProvider.KVS:
++        servers = data.get("iceServers")
++        if not isinstance(servers, list):
++            raise LiveViewError("Live-view response is missing valid iceServers")
++        return KinesisLiveView(
++            signed_channel_endpoint=_required_url(
++                data, "signedChannelEndpoint", {"wss"}
++            ),
++            client_id=_required_string(data, "clientId"),
++            ice_servers=tuple(_parse_ice_server(server) for server in servers),
++        )
++    if provider == CameraStreamProvider.MIST:
++        details = data.get("liveKitDetails")
++        if not isinstance(details, Mapping):
++            raise LiveViewError("Live-view response is missing liveKitDetails")
++        return LiveKitLiveView(
++            livekit_url=_required_url(details, "liveKitURL", {"wss", "https"}),
++            user_token=_required_string(details, "userToken"),
++        )
++    raise LiveViewError("Expected a supported WebRTC provider")
+diff --git a/tests/fixtures/kvs_live_view_response.json b/tests/fixtures/kvs_live_view_response.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..8db4cef259bc77f6ae205d91a6d4657856d9f3a1
+--- /dev/null
++++ b/tests/fixtures/kvs_live_view_response.json
+@@ -0,0 +1,12 @@
++{
++  "signedChannelEndpoint": "wss://signal.example.test/connect?X-Amz-Signature=temporary-signature",
++  "clientId": "viewer-id",
++  "iceServers": [
++    {"urls": ["stun:stun.example.test:443"]},
++    {
++      "urls": ["turns:turn.example.test:443?transport=tcp"],
++      "username": "temporary-turn-user",
++      "credential": "temporary-turn-password"
++    }
++  ]
++}
+diff --git a/tests/fixtures/mist_live_view_response.json b/tests/fixtures/mist_live_view_response.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bb89c3b805bf6fa67916ab3d157227c2f995e3b
+--- /dev/null
++++ b/tests/fixtures/mist_live_view_response.json
+@@ -0,0 +1,7 @@
++{
++  "cameraStatus": "online",
++  "liveKitDetails": {
++    "liveKitURL": "wss://livekit.example.test",
++    "userToken": "temporary-livekit-token"
++  }
++}
+diff --git a/tests/test_camera_live_view.py b/tests/test_camera_live_view.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3431d79436889f1b9b7871181dc30aedee813cec
+--- /dev/null
++++ b/tests/test_camera_live_view.py
+@@ -0,0 +1,419 @@
++"""Test provider discovery, fresh credentials and live-view response contracts.
++
++The example.test fixtures are synthetic contracts derived from public clients,
++not captures of a working session or evidence of physical-camera playback.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from copy import deepcopy
++from datetime import timedelta
++from types import SimpleNamespace
++from typing import Any, cast
++from unittest.mock import AsyncMock, patch
++
++import aiohttp
++import pytest
++from aresponses import ResponsesMockServer
++
++from simplipy import API
++from simplipy.device import DeviceTypes
++from simplipy.device.camera import WEBRTC_URL_BASE, Camera
++from simplipy.device.live_view import (
++    CameraStreamProvider,
++    KinesisLiveView,
++    LegacyLiveView,
++    LiveKitLiveView,
++    parse_live_view_response,
++)
++from simplipy.errors import (
++    InvalidCredentialsError,
++    LiveViewError,
++    RequestError,
++    UnsupportedStreamProviderError,
++)
++from simplipy.system.v3 import SystemV3
++from simplipy.util.dt import utcnow
++
++from .common import TEST_ACCESS_TOKEN, TEST_CAMERA_ID, TEST_SYSTEM_ID, load_fixture
++
++HUB_HOST = "app-hub.prd.aser.simplisafe.com"
++HUB_PATH = f"/v2/cameras/{TEST_CAMERA_ID}/{TEST_SYSTEM_ID}/live-view"
++
++
++def make_camera(api: API, provider: Any = None) -> Camera:
++    """Create a camera without cloud calls, keeping UUID and serial distinct."""
++    data = json.loads(load_fixture("subscriptions_response.json"))["subscriptions"][0][
++        "location"
++    ]["system"]["cameras"][0]
++    data["serial"] = "hardware-serial"
++    data["cameraSettings"]["admin"]["webRTCProvider"] = provider
++    system = cast(
++        SystemV3,
++        SimpleNamespace(
++            _api=api, system_id=TEST_SYSTEM_ID, camera_data={TEST_CAMERA_ID: data}
++        ),
++    )
++    return Camera(system, DeviceTypes.CAMERA, TEST_CAMERA_ID)
++
++
++@pytest.mark.parametrize(
++    ("provider", "expected"),
++    [
++        (None, CameraStreamProvider.LEGACY),
++        ("", CameraStreamProvider.LEGACY),
++        ("simplisafe", CameraStreamProvider.LEGACY),
++        ("kvs", CameraStreamProvider.KVS),
++        ("mist", CameraStreamProvider.MIST),
++        ("future-provider", CameraStreamProvider.UNKNOWN),
++        (7, CameraStreamProvider.UNKNOWN),
++    ],
++)
++@pytest.mark.asyncio
++async def test_provider_discovery(
++    provider: Any, expected: CameraStreamProvider
++) -> None:
++    """Discover a transport using provider settings, independently of model."""
++    async with aiohttp.ClientSession() as session:
++        camera = make_camera(API(session=session), provider)
++        assert camera.uuid == camera.serial == TEST_CAMERA_ID
++        assert camera.uuid != "hardware-serial"
++        assert camera.stream_provider == expected
++        assert camera.webrtc_provider == (
++            provider or None if isinstance(provider, str) else None
++        )
++        camera._system.camera_data[TEST_CAMERA_ID]["model"] = "unknown-model"
++        assert camera.stream_provider == expected
++        camera.camera_settings["admin"] = None
++        assert camera.webrtc_provider is None
++        assert camera.stream_provider == CameraStreamProvider.LEGACY
++
++
++@pytest.mark.parametrize(
++    ("provider", "fixture", "expected_type"),
++    [
++        ("kvs", "kvs_live_view_response.json", KinesisLiveView),
++        ("mist", "mist_live_view_response.json", LiveKitLiveView),
++    ],
++)
++@pytest.mark.asyncio
++async def test_fresh_live_view_and_private_logging(
++    aresponses: ResponsesMockServer,
++    caplog: pytest.LogCaptureFixture,
++    provider: str,
++    fixture: str,
++    expected_type: type,
++) -> None:
++    """Fetch each session, preserving app-hub Host/auth and hiding secrets."""
++    payload = json.loads(load_fixture(fixture))
++    second_payload = deepcopy(payload)
++    if provider == "mist":
++        second_payload["liveKitDetails"]["userToken"] = "replacement-livekit-token"
++    else:
++        second_payload["signedChannelEndpoint"] += "&session=second"
++
++    async def response(request: aiohttp.web.Request) -> aiohttp.web.Response:
++        assert request.headers["Host"] == HUB_HOST
++        assert request.headers["Authorization"] == f"Bearer {TEST_ACCESS_TOKEN}"
++        assert "access_token" not in request.query
++        return aiohttp.web.json_response(payload)
++
++    aresponses.add(HUB_HOST, HUB_PATH, "get", response=response)
++    aresponses.add(
++        HUB_HOST, HUB_PATH, "get", response=aiohttp.web.json_response(second_payload)
++    )
++    caplog.set_level(logging.DEBUG, logger="simplipy")
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session)
++        api.access_token = TEST_ACCESS_TOKEN
++        camera = make_camera(api, provider)
++        first = await camera.async_get_live_view()
++        second = await camera.async_get_live_view()
++        assert isinstance(first, expected_type)
++        assert first != second
++        if isinstance(first, KinesisLiveView):
++            assert first.ice_servers[1].credential == "temporary-turn-password"
++            assert first.ice_servers[0].username is None
++        else:
++            assert isinstance(first, LiveKitLiveView)
++            assert first.user_token == "temporary-livekit-token"
++        assert "temporary-signature" not in repr(first)
++        assert "temporary-turn-password" not in repr(first)
++        assert "temporary-livekit-token" not in repr(first)
++        assert "replacement-livekit-token" not in repr(second)
++        assert "temporary-livekit-token" not in json.dumps(camera.as_dict())
++        assert "temporary-signature" not in caplog.text
++        assert "temporary-turn-password" not in caplog.text
++        assert "temporary-livekit-token" not in caplog.text
++        assert "replacement-livekit-token" not in caplog.text
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.asyncio
++async def test_unflagged_live_view_is_private(
++    aresponses: ResponsesMockServer, caplog: pytest.LogCaptureFixture
++) -> None:
++    """Protect credentials even when a caller omits the sensitive flag."""
++    payload = json.loads(load_fixture("mist_live_view_response.json"))
++    aresponses.add(
++        HUB_HOST, HUB_PATH, "get", response=aiohttp.web.json_response(payload)
++    )
++    caplog.set_level(logging.DEBUG, logger="simplipy")
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session)
++        result = await api.async_request(
++            "get", HUB_PATH.removeprefix("/v2/"), url_base=WEBRTC_URL_BASE
++        )
++        assert result == payload
++    assert "temporary-livekit-token" not in caplog.text
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.asyncio
++async def test_legacy_authentication_and_current_token(
++    aresponses: ResponsesMockServer,
++) -> None:
++    """Return FLV bearer headers with the current token for every viewer."""
++    aresponses.add(
++        "api.simplisafe.com",
++        "/v1/api/authCheck",
++        "get",
++        response=aiohttp.web.json_response({"userId": 12345}),
++        repeat=2,
++    )
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session)
++        api.access_token = "first-access-token"
++        camera = make_camera(api)
++        first = await camera.async_get_live_view(width=720, audio_encoding="OPUS")
++        api.access_token = "refreshed-access-token"
++        second = await camera.async_get_live_view()
++        assert isinstance(first, LegacyLiveView)
++        assert first.url == camera.video_url(width=720, audio_encoding="OPUS")
++        assert first.headers["Authorization"] == "Bearer first-access-token"
++        assert isinstance(second, LegacyLiveView)
++        assert second.headers["Authorization"] == "Bearer refreshed-access-token"
++        assert "access_token" not in second.url
++        assert "refreshed-access-token" not in repr(second)
++        with pytest.raises(TypeError):
++            second.headers["Authorization"] = "mutable"  # type: ignore[index]
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.asyncio
++async def test_unsupported_and_missing_token() -> None:
++    """Reject unknown providers before requesting a session, and absent auth."""
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session)
++        api.async_request = AsyncMock(return_value={})
++        with pytest.raises(UnsupportedStreamProviderError):
++            await make_camera(api, "future-provider").async_get_live_view()
++        api.async_request.assert_not_called()
++        with pytest.raises(InvalidCredentialsError):
++            await make_camera(api).async_get_live_view()
++
++
++@pytest.mark.parametrize("provider", [None, "mist"])
++@pytest.mark.asyncio
++async def test_expired_access_token_refresh(
++    aresponses: ResponsesMockServer,
++    api_token_response: dict[str, Any],
++    caplog: pytest.LogCaptureFixture,
++    provider: str | None,
++) -> None:
++    """An expired account token refreshes and retries the same live-view request."""
++    host = HUB_HOST if provider else "api.simplisafe.com"
++    path = HUB_PATH if provider else "/v1/api/authCheck"
++    aresponses.add(
++        host, path, "get", response=aresponses.Response(status=401, text="Unauthorized")
++    )
++    new_tokens = {
++        **api_token_response,
++        "access_token": "new-access-token",
++        "refresh_token": "new-refresh-token",
++    }
++    aresponses.add(
++        "auth.simplisafe.com",
++        "/oauth/token",
++        "post",
++        response=aiohttp.web.json_response(new_tokens),
++    )
++
++    async def success(request: aiohttp.web.Request) -> aiohttp.web.Response:
++        assert request.headers["Authorization"] == "Bearer new-access-token"
++        payload = (
++            json.loads(load_fixture("mist_live_view_response.json"))
++            if provider
++            else {"userId": 12345}
++        )
++        return aiohttp.web.json_response(payload)
++
++    aresponses.add(host, path, "get", response=success)
++    caplog.set_level(logging.DEBUG, logger="simplipy")
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session, request_retries=2)
++        api.access_token = "old-access-token"
++        api.refresh_token = "old-refresh-token"
++        api._token_last_refreshed = utcnow() - timedelta(seconds=30)
++        with patch("asyncio.sleep", new_callable=AsyncMock):
++            view = await make_camera(api, provider).async_get_live_view()
++        assert api.access_token == "new-access-token"
++        assert api.refresh_token == "new-refresh-token"
++        if isinstance(view, LegacyLiveView):
++            assert view.headers["Authorization"] == "Bearer new-access-token"
++        assert "new-access-token" not in caplog.text
++        assert "new-refresh-token" not in caplog.text
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.parametrize("status", [401, 403, 429, 503])
++@pytest.mark.asyncio
++async def test_live_view_http_error(
++    aresponses: ResponsesMockServer, status: int
++) -> None:
++    """Use the existing request error policy for authentication and service errors."""
++    aresponses.add(
++        HUB_HOST,
++        HUB_PATH,
++        "get",
++        response=aiohttp.web.json_response(
++            {"message": "temporary-livekit-token"}, status=status
++        ),
++    )
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session, request_retries=1)
++        api.access_token = TEST_ACCESS_TOKEN
++        with pytest.raises(RequestError) as error:
++            await make_camera(api, "mist").async_get_live_view()
++        assert "temporary-livekit-token" not in str(error.value)
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.parametrize(
++    "payload",
++    [[], None, 42, {"liveKitDetails": {"userToken": "temporary-livekit-token"}}],
++)
++@pytest.mark.asyncio
++async def test_invalid_api_response(
++    aresponses: ResponsesMockServer, payload: Any
++) -> None:
++    """Reject malformed API responses without returning partial credentials."""
++    aresponses.add(
++        HUB_HOST, HUB_PATH, "get", response=aiohttp.web.json_response(payload)
++    )
++    async with aiohttp.ClientSession() as session:
++        api = API(session=session)
++        with pytest.raises(RequestError):
++            await make_camera(api, "mist").async_get_live_view()
++    aresponses.assert_plan_strictly_followed()
++
++
++@pytest.mark.parametrize(
++    ("provider", "data"),
++    [
++        (CameraStreamProvider.MIST, {}),
++        (CameraStreamProvider.MIST, {"liveKitDetails": "secret"}),
++        (
++            CameraStreamProvider.MIST,
++            {
++                "liveKitDetails": {
++                    "liveKitURL": "http://plain.test",
++                    "userToken": "secret",
++                }
++            },
++        ),
++        (
++            CameraStreamProvider.MIST,
++            {"liveKitDetails": {"liveKitURL": "wss://[invalid", "userToken": "secret"}},
++        ),
++        (
++            CameraStreamProvider.MIST,
++            {"liveKitDetails": {"liveKitURL": "wss://live.test", "userToken": ""}},
++        ),
++        (
++            CameraStreamProvider.MIST,
++            {
++                "liveKitDetails": {
++                    "liveKitURL": "wss://live.test",
++                    "userToken": "secret\r\n",
++                }
++            },
++        ),
++        (CameraStreamProvider.KVS, {"iceServers": []}),
++        (
++            CameraStreamProvider.KVS,
++            {"signedChannelEndpoint": "wss://signal.test", "clientId": "id"},
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [None],
++            },
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [{"urls": []}],
++            },
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [{"urls": ["https://invalid.test"]}],
++            },
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [{"urls": [1]}],
++            },
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [{"urls": ["turn:host"], "username": 1}],
++            },
++        ),
++        (
++            CameraStreamProvider.KVS,
++            {
++                "signedChannelEndpoint": "wss://signal.test",
++                "clientId": "id",
++                "iceServers": [{"urls": ["turn:host"], "credential": 1}],
++            },
++        ),
++        (CameraStreamProvider.LEGACY, {}),
++        (CameraStreamProvider.MIST, None),
++    ],
++)
++def test_malformed_provider_contract(provider: CameraStreamProvider, data: Any) -> None:
++    """Report malformed fields without reproducing credentials in errors."""
++    with pytest.raises(LiveViewError) as error:
++        parse_live_view_response(provider, data)
++    assert "secret" not in str(error.value)
++
++
++def test_ice_server_string_urls() -> None:
++    """Accept the WebRTC single-string ICE URLs representation as well as lists."""
++    view = parse_live_view_response(
++        CameraStreamProvider.KVS,
++        {
++            "signedChannelEndpoint": "wss://signal.test",
++            "clientId": "id",
++            "iceServers": [{"urls": "stun:host"}],
++        },
++    )
++    assert isinstance(view, KinesisLiveView)
++    assert view.ice_servers[0].urls == ("stun:host",)

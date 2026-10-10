@@ -1,0 +1,115 @@
+views:
+  - title: On demand
+    path: cameras
+    type: sections
+    max_columns: 2
+    sections:
+      - type: grid
+        cards:
+          - type: picture-entity
+            entity: camera.example_legacy_a
+            name: Legacy camera A
+            camera_view: auto
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+          - type: picture-entity
+            entity: camera.example_legacy_b
+            name: Legacy camera B
+            camera_view: auto
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+      - type: grid
+        cards:
+          - type: picture-entity
+            entity: camera.example_outdoor_a
+            name: Outdoor camera A
+            camera_view: auto
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+          - type: picture-entity
+            entity: camera.example_outdoor_b
+            name: Outdoor camera B
+            camera_view: auto
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+  - title: Live view
+    path: live
+    type: sections
+    max_columns: 2
+    sections:
+      - type: grid
+        cards:
+          - type: custom:simplisafe-camera-live
+            entity: camera.example_legacy_a
+            name: Legacy camera A
+            camera_view: live
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+          - type: custom:simplisafe-camera-live
+            entity: camera.example_legacy_b
+            name: Legacy camera B
+            camera_view: live
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+      - type: grid
+        cards:
+          - type: custom:simplisafe-camera-live
+            entity: camera.example_outdoor_a
+            name: Outdoor camera A
+            camera_view: live
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto
+          - type: custom:simplisafe-camera-live
+            entity: camera.example_outdoor_b
+            name: Outdoor camera B
+            camera_view: live
+            aspect_ratio: '16:9'
+            show_state: false
+            show_name: true
+            tap_action:
+              action: more-info
+            grid_options:
+              columns: 12
+              rows: auto

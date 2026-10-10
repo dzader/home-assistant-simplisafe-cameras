@@ -1,0 +1,3342 @@
+diff --git a/README.md b/README.md
+index f661aaa634ec69a31e12234809f4300d6abef2ca..527e2505048c090b5c13169711f961f08404cb71 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # SimpliRTC
+ 
+-SimpliRTC adds native WebRTC support for SimpliSafe cameras in Home Assistant.
++SimpliRTC adds SimpliSafe camera streaming to Home Assistant dashboards.
+ 
+ SimpliRTC requires the native Home Assistant SimpliSafe integration to be set up,
+ and adds camera support to the existing integration.
+@@ -34,7 +34,7 @@ Only SimpliSafe V3 systems are supported. Older system versions are skipped.
+ 
+ SimpliSafe uses different video backends for different accounts and systems.
+ Some cameras use AWS Kinesis Video Streams, and some use LiveKit. SimpliRTC
+-supports both of those backends.
++supports both of those backends and the older HTTPS FLV backend.
+ 
+ Some reported systems use a different backend that SimpliRTC does not currently
+ support. Cameras on unknown backends are intentionally ignored instead of being
+@@ -56,5 +56,44 @@ SimpliRTC currently recognizes these values:
+ 
+ - `kvs`: AWS Kinesis Video Streams
+ - `mist`: LiveKit
++- `simplisafe` or a missing provider value: HTTPS FLV through Home Assistant stream
++
++Other provider values are treated as unknown and skipped.
++
++## Local streaming changes
++
++This checkout adds the older SimpliSafe HTTPS FLV backend. A missing
++`webRTCProvider` value or the value `simplisafe` selects FLV; `kvs` selects
++Kinesis WebRTC; `mist` selects LiveKit WebRTC. Unknown or malformed providers
++are skipped and described in the integration diagnostics.
++
++FLV uses Home Assistant's native stream integration. A private HTTP relay
++listens only on `127.0.0.1` on an automatically assigned port. It forwards the
++camera's FLV bytes using the existing SimpliSafe integration's current OAuth
++bearer token and verifies the upstream HTTPS connection. OAuth credentials
++are kept out of dashboard URLs, entity attributes, and integration diagnostics.
++No additional login or alarm integration replacement is needed.
++
++LiveKit preparation, battery-camera wake attempts, and WebRTC answers have
++bounded waits. Closing a dashboard stream or unloading the integration closes
++its signaling sessions. Unloading a legacy camera also closes its local relay
++and active upstream HTTP connections. Reloading the native SimpliSafe
++integration rebinds camera entities to its current authenticated API client.
++
++These changes have automated tests against actual Home Assistant camera
++interfaces and controlled local media/signaling sources. They still require
++verification with your cameras; SimpliSafe does not publish or guarantee these
++streaming APIs. LiveKit and Kinesis work through browser WebRTC, and their live
++video is not exposed as an RTSP URL for third-party recorders.
++
++To run the tests in a Python environment containing Home Assistant and this
++integration's manifest requirements:
++
++```sh
++python -m pip install pytest pytest-asyncio ruff
++python -m pytest tests -q
++ruff check .
++```
+ 
+-Any other `webRTCProvider` value is treated as unknown and skipped.
++Tests create local loopback HTTP and WebRTC sockets and use synthetic data.
++They do not connect to Home Assistant or SimpliSafe accounts.
+diff --git a/custom_components/simplirtc/__init__.py b/custom_components/simplirtc/__init__.py
+index c82c5c5d88aa55c2e49063a0bbb66d8b7d95ea6f..43d045fd7dcc1fc662833a6ced497bb2e8219e7d 100644
+--- a/custom_components/simplirtc/__init__.py
++++ b/custom_components/simplirtc/__init__.py
+@@ -5,32 +5,37 @@ from __future__ import annotations
+ import asyncio
+ import logging
+ 
+-from homeassistant.const import (
+-	Platform,
++from homeassistant.components.simplisafe import (
++	DOMAIN as SIMPLISAFE_DOMAIN,
++)
++from homeassistant.components.simplisafe import (
++	SimpliSafe,
+ )
+-from homeassistant.core import HomeAssistant, callback
+ from homeassistant.config_entries import (
++	SIGNAL_CONFIG_ENTRY_CHANGED,
++	SOURCE_SYSTEM,
+ 	ConfigEntry,
+-	ConfigEntryState,
+ 	ConfigEntryChange,
+-	SOURCE_SYSTEM,
+-	SIGNAL_CONFIG_ENTRY_CHANGED,
++	ConfigEntryState,
++)
++from homeassistant.const import (
++	Platform,
+ )
++from homeassistant.core import HomeAssistant, callback
++from homeassistant.exceptions import ConfigEntryNotReady
+ from homeassistant.helpers import (
+-	discovery_flow,
+ 	config_validation as cv,
+ )
++from homeassistant.helpers import (
++	discovery_flow,
++)
+ from homeassistant.helpers.dispatcher import async_dispatcher_connect
+ from homeassistant.helpers.typing import ConfigType
+ from homeassistant.setup import async_when_setup
+-from homeassistant.components.simplisafe import (
+-	DOMAIN as SIMPLISAFE_DOMAIN,
+-	SimpliSafe,
+-)
+ 
+ from .const import (
+-	DOMAIN,
+ 	ATTR_CONFIG_ENTRY_ID,
++	DOMAIN,
+ )
+ from .webrtc import async_register_webrtc_client_config_handler
+ 
+@@ -45,27 +50,52 @@ _LOGGER = logging.getLogger(__name__)
+ 
+ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+ 	"""Set up the Simplirtc component."""
+-	async_when_setup(
+-		hass, Platform.CAMERA, async_register_webrtc_client_config_handler
+-	)
++	async_when_setup(hass, Platform.CAMERA, async_register_webrtc_client_config_handler)
+ 
+ 	if DOMAIN not in config:
+ 		return True
+ 
++	sync_lock = asyncio.Lock()
++
++	async def synchronize(entry_id: str) -> None:
++		"""Serialize native reloads and evaluate the latest parent state."""
++		async with sync_lock:
++			parent = hass.config_entries.async_get_entry(entry_id)
++			children = [
++				child
++				for child in hass.config_entries.async_entries(DOMAIN)
++				if child.data.get(ATTR_CONFIG_ENTRY_ID) == entry_id
++			]
++			if parent is None:
++				await _async_remove_config_entries(hass, entry_id)
++			elif parent.state == ConfigEntryState.LOADED:
++				if not children:
++					discovery_flow.async_create_flow(
++						hass,
++						DOMAIN,
++						context={"source": SOURCE_SYSTEM},
++						data={ATTR_CONFIG_ENTRY_ID: entry_id},
++					)
++				for child in children:
++					if (
++						child.state != ConfigEntryState.LOADED
++						or child.runtime_data is not parent.runtime_data
++					):
++						await hass.config_entries.async_reload(child.entry_id)
++			elif parent.state == ConfigEntryState.NOT_LOADED:
++				for child in children:
++					if child.state == ConfigEntryState.LOADED:
++						await hass.config_entries.async_unload(child.entry_id)
++
+ 	@callback
+ 	def async_config_entry_changed(change: ConfigEntryChange, entry: ConfigEntry) -> None:
+ 		if entry.domain != SIMPLISAFE_DOMAIN:
+ 			return
+-
+-		match change:
+-			case ConfigEntryChange.ADDED | ConfigEntryChange.UPDATED:
+-				if entry.state == ConfigEntryState.LOADED:
+-					discovery_flow.async_create_flow(
+-						hass, DOMAIN, context={"source": SOURCE_SYSTEM}, data={ATTR_CONFIG_ENTRY_ID: entry.entry_id}
+-					)
+-			case ConfigEntryChange.REMOVED:
+-				# If the entry is removed, we need to unload the platforms
+-				hass.async_create_task(_async_remove_config_entries(hass, entry.entry_id))
++		if change == ConfigEntryChange.REMOVED or entry.state in {
++			ConfigEntryState.LOADED,
++			ConfigEntryState.NOT_LOADED,
++		}:
++			hass.async_create_task(synchronize(entry.entry_id))
+ 
+ 	async_dispatcher_connect(
+ 		hass,
+@@ -78,24 +108,33 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+ 
+ 	return True
+ 
++
+ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[SimpliSafe]) -> bool:
+ 	"""Set up SimpliSafe from a config entry."""
+ 	entry_id: str = entry.data[ATTR_CONFIG_ENTRY_ID]
+ 
+-	simplisafe_entry: ConfigEntry[SimpliSafe] | None = (
+-		hass.config_entries.async_get_entry(entry_id)
+-	)
++	simplisafe_entry: ConfigEntry[SimpliSafe] | None = hass.config_entries.async_get_entry(entry_id)
+ 	if simplisafe_entry is None:
+ 		_LOGGER.debug("Skipping setup for missing SimpliSafe entry: %s", entry_id)
+ 		return False
+ 
++	if simplisafe_entry.state != ConfigEntryState.LOADED:
++		raise ConfigEntryNotReady("The native SimpliSafe integration is not loaded")
+ 	entry.runtime_data = simplisafe_entry.runtime_data
+ 	await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+ 	return True
+ 
++
++async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
++	"""Unload camera and event entities without unloading the native alarm integration."""
++	return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
++
++
+ async def _async_remove_config_entries(hass: HomeAssistant, entry_id: str):
+-	await asyncio.gather(*(
+-		hass.config_entries.async_remove(entry.entry_id)
+-		for entry in hass.config_entries.async_entries(DOMAIN)
+-		if entry.data.get(ATTR_CONFIG_ENTRY_ID) == entry_id
+-	))
++	await asyncio.gather(
++		*(
++			hass.config_entries.async_remove(entry.entry_id)
++			for entry in hass.config_entries.async_entries(DOMAIN)
++			if entry.data.get(ATTR_CONFIG_ENTRY_ID) == entry_id
++		)
++	)
+diff --git a/custom_components/simplirtc/camera.py b/custom_components/simplirtc/camera.py
+index 50f15331c0981152d2830f2c991b685878be74fa..7742382662f3628ca30b4db26f160afd646f4cd8 100644
+--- a/custom_components/simplirtc/camera.py
++++ b/custom_components/simplirtc/camera.py
+@@ -3,11 +3,30 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-from collections.abc import Mapping
+-import functools
+ import logging
++import time
++from collections.abc import Mapping
++from secrets import token_hex
+ from typing import TypeVar, override
++from urllib.parse import quote, urlsplit
+ 
++from homeassistant.components.camera import (
++	Camera as CameraEntity,
++)
++from homeassistant.components.camera import (
++	CameraEntityDescription,
++	CameraEntityFeature,
++	WebRTCAnswer,
++	WebRTCClientConfiguration,  # pyright: ignore[reportPrivateImportUsage]
++	WebRTCError,
++	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
++)
++from homeassistant.components.simplisafe import SimpliSafe
++from homeassistant.components.simplisafe.entity import SimpliSafeEntity
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.core import HomeAssistant, callback
++from homeassistant.exceptions import HomeAssistantError
++from homeassistant.helpers.entity_platform import AddEntitiesCallback
+ from pydantic import Field, TypeAdapter
+ from pydantic.dataclasses import dataclass
+ from simplipy.device.camera import Camera
+@@ -21,31 +40,25 @@ from webrtc_models import (
+ 	RTCIceServer,
+ )
+ 
+-from homeassistant.config_entries import ConfigEntry
+-from homeassistant.components.camera import (
+-	Camera as CameraEntity,
+-	CameraEntityFeature,
+-	CameraEntityDescription,
+-	WebRTCClientConfiguration,  # pyright: ignore[reportPrivateImportUsage]
+-	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
+-)
+-from homeassistant.components.simplisafe import SimpliSafe
+-from homeassistant.components.simplisafe.entity import SimpliSafeEntity
+-from homeassistant.core import HomeAssistant, callback
+-from homeassistant.exceptions import HomeAssistantError
+-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+-
++from .backend import CameraBackend, describe_backend
+ from .kinesis import KinesisSession
+-from .livekit import LiveKitSession
++from .legacy import LegacyStreamRelay
++from .livekit import LiveKitCredentialMetadata, LiveKitSession, read_credential_metadata
+ from .protobufs.livekit_rtc_pb2 import ICEServer as LiveKitIceServer
++from .security import redact_live_view_logging
+ from .webrtc import (
+-	WebRTCClientConfigurationMixin,
+ 	SimpliSafeWebRTCSession,
++	WebRTCClientConfigurationMixin,
+ )
+ 
+ _LOGGER = logging.getLogger(__name__)
+ WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+ UNUSED_WEBRTC_SESSION_TTL = 30
++WEBRTC_PREPARATION_TIMEOUT = 30
++WEBRTC_OFFER_TIMEOUT = 30
++LIVE_VIEW_ATTEMPTS = 5
++LIVE_VIEW_RETRY_DELAY = 2
++MAX_UNUSED_SESSIONS = 2
+ _StreamResponseT = TypeVar("_StreamResponseT")
+ 
+ 
+@@ -57,15 +70,24 @@ async def async_setup_entry(
+ 	"""Set up a SimpliSafe Camera."""
+ 	simplisafe = entry.runtime_data
+ 
+-	cameras: list[SimpliSafeCamera] = []
++	cameras: list[SimpliSafeCameraBase] = []
+ 
+ 	for system in simplisafe.systems.values():
+ 		if not isinstance(system, SystemV3):
+-			_LOGGER.warning("Skipping camera setup for V%d system: %s", system.version, system.system_id)
++			_LOGGER.warning(
++				"Skipping camera setup for V%d system: %s", system.version, system.system_id
++			)
+ 			continue
+ 
+ 		for camera in system.cameras.values():
+-			cameras.append(SimpliSafeCamera(simplisafe, system, camera))
++			provider, backend, reason = describe_backend(camera.camera_settings)
++			if backend == CameraBackend.UNKNOWN:
++				_LOGGER.warning("Skipping unsupported camera provider %r (%s)", provider, reason)
++				continue
++			entity_type = (
++				SimpliSafeLegacyCamera if backend == CameraBackend.LEGACY else SimpliSafeCamera
++			)
++			cameras.append(entity_type(simplisafe, system, camera))
+ 
+ 	async_add_entities(cameras)
+ 
+@@ -78,7 +100,7 @@ class KinesisIceServer:
+ 
+ 
+ @dataclass(kw_only=True, slots=True)
+-class KenisisResponse:
++class KinesisResponse:
+ 	signedChannelEndpoint: str
+ 	clientId: str
+ 	iceServers: list[KinesisIceServer]
+@@ -118,8 +140,7 @@ class EventHistoryResponse:
+ 	events: list[EventHistoryEvent]
+ 
+ 
+-class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+-	WebRTCClientConfigurationMixin,
++class SimpliSafeCameraBase(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 	SimpliSafeEntity,
+ 	CameraEntity,
+ ):
+@@ -133,8 +154,10 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 	) -> None:
+ 		"""Initialize the SimpliSafe camera."""
+ 		super().__init__(
+-			simplisafe, system, device=device,
+-			additional_websocket_events=(EVENT_CAMERA_MOTION_DETECTED,)
++			simplisafe,
++			system,
++			device=device,
++			additional_websocket_events=(EVENT_CAMERA_MOTION_DETECTED,),
+ 		)
+ 		self.entity_description = CameraEntityDescription(
+ 			key="live_view",
+@@ -144,11 +167,8 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 		self._attr_unique_id = f"{super().unique_id}-camera"
+ 		self._attr_supported_features |= CameraEntityFeature.STREAM
+ 		self._device: Camera
+-		self._sessions: dict[str, SimpliSafeWebRTCSession] = {}
+-		self._unused_session_expirations: dict[
+-			SimpliSafeWebRTCSession, asyncio.TimerHandle
+-		] = {}
+ 		self._snapshot_template_url: str | None = None
++		redact_live_view_logging()
+ 
+ 	@override
+ 	async def async_camera_image(
+@@ -224,28 +244,198 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 					serials.add(serial)
+ 		return serials
+ 
+-	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
+-		return TypeAdapter(response_type).validate_python(
+-			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
+-				"get", f"cameras/{self._device.serial}/{self._system.system_id}/live-view",
+-				url_base=WEBRTC_URL_BASE,
+-			)
+-		)
++	@override
++	async def async_will_remove_from_hass(self) -> None:
++		"""Stop this camera's decoder even when stream preloading was enabled."""
++		if self.stream is not None:
++			self.stream.dynamic_stream_settings.preload_stream = False
++			await self.stream.stop()
++			self.stream = None
++		await super().async_will_remove_from_hass()
++
++	@property
++	def _camera_uuid(self) -> str:
++		"""Use the API UUID when camera events use a hardware serial instead."""
++		data = self._system.camera_data.get(self._device.serial, {})
++		uuid = data.get("uuid") if isinstance(data, Mapping) else None
++		return uuid if isinstance(uuid, str) and uuid else self._device.serial
+ 
+ 	@property
+ 	def _web_rtc_provider(self) -> str | None:
+-		if not isinstance(settings := self._device.camera_settings.get("admin"), Mapping):
+-			return None
+-		if provider := settings.get("webRTCProvider"):  # pyright: ignore[reportUnknownMemberType]
+-			return str(provider)
++		return describe_backend(self._device.camera_settings)[0]
+ 
+ 	@property
+ 	def extra_state_attributes(self) -> dict[str, str | None]:
+-		"""Return camera-specific state attributes."""
+-		return {"webrtc_provider": self._web_rtc_provider}
++		"""Return transport information without provider URLs or credentials."""
++		provider, backend, _ = describe_backend(self._device.camera_settings)
++		return {"webrtc_provider": provider, "stream_backend": backend.value}
++
++
++class SimpliSafeLegacyCamera(SimpliSafeCameraBase):
++	"""Expose authenticated HTTPS FLV through Home Assistant's local decoder."""
++
++	def __init__(self, simplisafe: SimpliSafe, system: SystemV3, device: Camera) -> None:
++		super().__init__(simplisafe, system, device)
++		self._relay = LegacyStreamRelay(self._simplisafe._api, self._camera_uuid)
++
++	@override
++	async def stream_source(self) -> str:
++		"""Return a private loopback source accepted by the native stream worker."""
++		try:
++			return await self._relay.source()
++		except Exception:
++			raise HomeAssistantError("Unable to start the SimpliSafe camera stream relay") from None
++
++	@override
++	async def async_will_remove_from_hass(self) -> None:
++		await self._relay.close()
++		await super().async_will_remove_from_hass()
++
++
++class SimpliSafeCamera(WebRTCClientConfigurationMixin, SimpliSafeCameraBase):
++	"""Bridge cloud WebRTC signaling to Home Assistant's native browser player."""
++
++	def __init__(self, simplisafe: SimpliSafe, system: SystemV3, device: Camera) -> None:
++		super().__init__(simplisafe, system, device)
++		self._sessions: dict[str, SimpliSafeWebRTCSession] = {}
++		self._session_senders: dict[str, WebRTCSendMessage] = {}
++		self._offer_timers: dict[str, asyncio.TimerHandle] = {}
++		self._unused_session_expirations: dict[SimpliSafeWebRTCSession, asyncio.TimerHandle] = {}
++		self._preparing_sessions: set[SimpliSafeWebRTCSession] = set()
++		self._preparation_tasks: set[asyncio.Task] = set()
++		self._stream_logger = _LOGGER.getChild(f"stream.{token_hex(4)}")
++		self._initial_credential_metadata: LiveKitCredentialMetadata | None = None
++		self._live_view_requests = 0
++		self._last_live_view_log_at: float | None = None
++		self._last_live_view_summary: tuple | None = None
++		self._removed = False
++
++	async def _request_live_view(self) -> dict:
++		"""Request live view using the native integration's current authentication."""
++		response = await self._simplisafe._api.async_request(
++			"get",
++			f"cameras/{quote(self._camera_uuid, safe='')}/{self._system.system_id}/live-view",
++			url_base=WEBRTC_URL_BASE,
++			headers={"Host": urlsplit(WEBRTC_URL_BASE).netloc},
++		)
++		self._log_live_view_metadata(response)
++		return response
++
++	def _log_live_view_metadata(self, response: Mapping) -> None:
++		"""Report response health and claim continuity without logging credentials."""
++		self._live_view_requests += 1
++		if not isinstance(response, Mapping):
++			return
++		status = response.get("cameraStatus")
++		if not isinstance(status, str) or status not in {
++			"online",
++			"offline",
++			"sleeping",
++			"waking",
++			"unavailable",
++		}:
++			status = "unknown"
++		metadata = LiveKitCredentialMetadata()
++		if isinstance(details := response.get("liveKitDetails"), Mapping) and isinstance(
++			token := details.get("userToken"), str
++		):
++			metadata = read_credential_metadata(token)
++		initial = self._initial_credential_metadata
++		same_room = (
++			metadata.room == initial.room
++			if initial is not None and initial.room is not None and metadata.room is not None
++			else None
++		)
++		same_subject = (
++			metadata.subject == initial.subject
++			if initial is not None and initial.subject is not None and metadata.subject is not None
++			else None
++		)
++		if initial is None and (metadata.room is not None or metadata.subject is not None):
++			self._initial_credential_metadata = metadata
++		summary = (status, same_room, same_subject)
++		now = time.monotonic()
++		if (
++			self._last_live_view_log_at is None
++			or now - self._last_live_view_log_at >= 60
++			or summary != self._last_live_view_summary
++		):
++			self._last_live_view_log_at = now
++			self._last_live_view_summary = summary
++			self._stream_logger.info(
++				"Live-view response status=%s request_count=%s same_room=%s same_subject=%s "
++				"claimed_credential_lifetime_s=%s claimed_credential_expires_in_s=%s",
++				*summary[:1],
++				self._live_view_requests,
++				*summary[1:],
++				metadata.expires_at - metadata.issued_at
++				if metadata.expires_at is not None and metadata.issued_at is not None
++				else None,
++				metadata.expires_at - int(time.time()) if metadata.expires_at is not None else None,
++			)
++
++	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
++		"""Request ephemeral credentials, allowing a bounded battery-camera wakeup."""
++		for attempt in range(LIVE_VIEW_ATTEMPTS):
++			response = await self._request_live_view()
++			if (
++				response_type == LiveKitResponse
++				and not response.get("liveKitDetails")
++				and response.get("cameraStatus") in {"sleeping", "waking"}
++				and attempt < LIVE_VIEW_ATTEMPTS - 1
++			):
++				await asyncio.sleep(LIVE_VIEW_RETRY_DELAY)
++				continue
++			return TypeAdapter(response_type).validate_python(response)
++		raise HomeAssistantError("SimpliSafe camera did not wake for live view")
++
++	@override
++	async def async_will_remove_from_hass(self) -> None:
++		"""Cancel preparations and close all signaling sessions during unload."""
++		self._removed = True
++		preparations = tuple(self._preparation_tasks)
++		for task in preparations:
++			task.cancel()
++		for timer in self._offer_timers.values():
++			timer.cancel()
++		self._offer_timers.clear()
++		for timer in self._unused_session_expirations.values():
++			timer.cancel()
++		sessions = (
++			set(self._sessions.values())
++			| set(self._unused_session_expirations)
++			| self._preparing_sessions
++		)
++		self._sessions.clear()
++		self._session_senders.clear()
++		self._unused_session_expirations.clear()
++		self._preparing_sessions.clear()
++		for session in sessions:
++			session.close()
++		await asyncio.gather(*preparations, return_exceptions=True)
++		await super().async_will_remove_from_hass()
+ 
+ 	async def async_prepare_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
+-		"""Create an unused provider session and return its client configuration."""
++		"""Create bounded provider signaling and report a safe client-facing failure."""
++		if self._removed:
++			raise HomeAssistantError("SimpliSafe camera has been unloaded")
++		task = asyncio.current_task()
++		assert task is not None
++		self._preparation_tasks.add(task)
++		try:
++			async with asyncio.timeout(WEBRTC_PREPARATION_TIMEOUT):
++				return await self._async_prepare_configuration()
++		except asyncio.CancelledError:
++			raise
++		except Exception as err:
++			_LOGGER.warning("Unable to prepare camera stream (%s)", type(err).__name__)
++			raise HomeAssistantError(
++				"Unable to prepare SimpliSafe live view; check camera connectivity and try again"
++			) from None
++		finally:
++			self._preparation_tasks.discard(task)
++
++	async def _async_prepare_configuration(self) -> WebRTCClientConfiguration:
+ 		ice_servers: list[KinesisIceServer | LiveKitIceServer] = []
+ 		match self._web_rtc_provider:
+ 			case "mist":
+@@ -259,34 +449,40 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 
+ 				def close_before_ice_servers() -> None:
+ 					if not ice_servers_ready.done():
+-						ice_servers_ready.set_exception(HomeAssistantError(
+-							f"LiveKit session closed before ICE servers were received for {self.entity_id}"
+-						))
++						ice_servers_ready.set_exception(
++							HomeAssistantError(
++								f"LiveKit session closed before ICE servers were received for {self.entity_id}"
++							)
++						)
+ 
+ 				session = LiveKitSession(
+ 					livekit_url=live_view.liveKitDetails.liveKitURL,
+ 					user_token=live_view.liveKitDetails.userToken,
+ 					send_ice_servers=send_ice_servers,
++					stream_logger=self._stream_logger.getChild("livekit"),
+ 				)
+ 
+ 				def on_close() -> None:
+ 					close_before_ice_servers()
+-					self._expire(session)
++					self._session_closed(session)
+ 
+-				session.start(on_close)
++				self._preparing_sessions.add(session)
+ 				try:
++					session.start(on_close)
+ 					await ice_servers_ready
+-				except asyncio.CancelledError:
++				except BaseException:
+ 					session.close()
+ 					raise
++				finally:
++					self._preparing_sessions.discard(session)
+ 			case "kvs":
+-				live_view = await self._create_stream(KenisisResponse)
++				live_view = await self._create_stream(KinesisResponse)
+ 				ice_servers.extend(live_view.iceServers)
+ 				session = KinesisSession(
+ 					channel_endpoint=live_view.signedChannelEndpoint,
+ 					client_id=live_view.clientId,
+ 				)
+-				session.start(functools.partial(self._expire, session))
++				session.start(lambda: self._session_closed(session))
+ 			case _ as provider:
+ 				raise HomeAssistantError(
+ 					f"Camera {self.name} has unknown webrtc provider {provider!r}"
+@@ -321,19 +517,36 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 			self._sessions[session_id] = session
+ 		else:
+ 			_LOGGER.debug("Renegotiating WebRTC session for %s", self.entity_id)
++		self._session_senders[session_id] = send_message
++		if (timer := self._offer_timers.pop(session_id, None)) is not None:
++			timer.cancel()
++		self._offer_timers[session_id] = self.hass.loop.call_later(
++			WEBRTC_OFFER_TIMEOUT,
++			self._offer_timed_out,
++			session_id,
++		)
++
++		def forward_message(message) -> None:
++			if isinstance(message, WebRTCAnswer):
++				if (timer := self._offer_timers.pop(session_id, None)) is not None:
++					timer.cancel()
++			send_message(message)
++
+ 		try:
+-			await session.handle_offer(offer_sdp, send_message)
+-		except Exception:
+-			self._sessions.pop(session_id, None)
+-			session.close()
+-			raise
++			async with asyncio.timeout(WEBRTC_OFFER_TIMEOUT):
++				await session.handle_offer(offer_sdp, forward_message)
++		except BaseException as err:
++			self.close_webrtc_session(session_id)
++			if isinstance(err, asyncio.CancelledError):
++				raise
++			raise HomeAssistantError("Unable to negotiate SimpliSafe camera live view") from None
+ 
+ 	@override
+ 	async def async_on_webrtc_candidate(
+ 		self, session_id: str, candidate: RTCIceCandidateInit
+ 	) -> None:
+ 		"""Handle a WebRTC candidate."""
+-		if (session := self._sessions.get(session_id)):
++		if session := self._sessions.get(session_id):
+ 			await session.send_candidate(candidate)
+ 		else:
+ 			_LOGGER.debug("Ignoring WebRTC candidate for closed session %s", session_id)
+@@ -342,7 +555,10 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 	@callback
+ 	def close_webrtc_session(self, session_id: str) -> None:
+ 		"""Close a WebRTC session."""
+-		if (session := self._sessions.pop(session_id, None)):
++		self._session_senders.pop(session_id, None)
++		if (timer := self._offer_timers.pop(session_id, None)) is not None:
++			timer.cancel()
++		if session := self._sessions.pop(session_id, None):
+ 			session.close()
+ 
+ 	@callback
+@@ -351,12 +567,51 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
+ 		session: SimpliSafeWebRTCSession,
+ 	) -> None:
+ 		"""Pool a session prepared by a client config request."""
++		if self._removed:
++			session.close()
++			return
++		while len(self._unused_session_expirations) >= MAX_UNUSED_SESSIONS:
++			self._expire(next(iter(self._unused_session_expirations)))
+ 		self._unused_session_expirations[session] = self.hass.loop.call_later(
+-			UNUSED_WEBRTC_SESSION_TTL, self._expire, session,
++			UNUSED_WEBRTC_SESSION_TTL,
++			self._expire,
++			session,
+ 		)
+ 
+ 	@callback
+ 	def _expire(self, session: SimpliSafeWebRTCSession) -> None:
+ 		"""Close an unused prepared session if the offer never arrives."""
+-		if self._unused_session_expirations.pop(session, None) is not None:
++		if (timer := self._unused_session_expirations.pop(session, None)) is not None:
++			timer.cancel()
+ 			session.close()
++
++	@callback
++	def _session_closed(self, session: SimpliSafeWebRTCSession) -> None:
++		"""Forget failed signaling and notify an attached browser instead of leaving stale sessions."""
++		if (timer := self._unused_session_expirations.pop(session, None)) is not None:
++			timer.cancel()
++		for session_id, active in tuple(self._sessions.items()):
++			if active is session:
++				self._sessions.pop(session_id)
++				if (timer := self._offer_timers.pop(session_id, None)) is not None:
++					timer.cancel()
++				if (send_message := self._session_senders.pop(session_id, None)) is not None:
++					send_message(
++						WebRTCError(
++							"stream_closed",
++							"SimpliSafe camera ended the live view; reconnect the camera"
++							if getattr(session, "camera_video_ended", False) is True
++							else "SimpliSafe camera signaling closed; reopen the live view",
++						)
++					)
++
++	@callback
++	def _offer_timed_out(self, session_id: str) -> None:
++		"""Stop signaling if a provider never answers the browser offer."""
++		if (send_message := self._session_senders.get(session_id)) is not None:
++			send_message(
++				WebRTCError(
++					"stream_timeout", "SimpliSafe camera did not answer; try the live view again"
++				)
++			)
++		self.close_webrtc_session(session_id)
+diff --git a/custom_components/simplirtc/config_flow.py b/custom_components/simplirtc/config_flow.py
+index e06ca1aac72f8d2051729b155f17a085a6f4627e..8c65dda6222125f3b142a806bb4363ae19e0df69 100644
+--- a/custom_components/simplirtc/config_flow.py
++++ b/custom_components/simplirtc/config_flow.py
+@@ -17,10 +17,10 @@ class CloudConfigFlow(ConfigFlow, domain=DOMAIN):
+ 
+ 	VERSION = 1
+ 
+-	async def async_step_system(
+-		self, user_input: dict[str, Any] | None = None
+-	) -> ConfigFlowResult:
++	async def async_step_system(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+ 		"""Handle the system step."""
+ 		assert user_input is not None, "user_input should not be None"
+ 		entry = self.hass.config_entries.async_get_known_entry(user_input[ATTR_CONFIG_ENTRY_ID])
++		await self.async_set_unique_id(entry.entry_id)
++		self._abort_if_unique_id_configured()
+ 		return self.async_create_entry(title=entry.title, data=user_input)
+diff --git a/custom_components/simplirtc/diagnostics.py b/custom_components/simplirtc/diagnostics.py
+index 2adab085f4b6824c704ef70a667a819f36f5b397..4a680cc15a78215e1c6574a4ca2b486d9a96e047 100644
+--- a/custom_components/simplirtc/diagnostics.py
++++ b/custom_components/simplirtc/diagnostics.py
+@@ -2,23 +2,15 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Mapping
+ from typing import Any
+ 
+-from simplipy.device.camera import Camera
+-from simplipy.system.v3 import SystemV3
+-
+-from homeassistant.components.diagnostics import async_redact_data
+ from homeassistant.components.simplisafe import SimpliSafe
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.core import HomeAssistant
++from simplipy.device.camera import Camera
++from simplipy.system.v3 import SystemV3
+ 
+-TO_REDACT = {
+-	"entry_id",
+-	"system_id",
+-	"title",
+-	"unique_id",
+-}
++from .backend import CameraBackend, describe_backend
+ 
+ 
+ async def async_get_config_entry_diagnostics(
+@@ -28,7 +20,11 @@ async def async_get_config_entry_diagnostics(
+ 	_ = hass
+ 	simplisafe = entry.runtime_data
+ 	data: dict[str, Any] = {
+-		"entry": async_redact_data(entry.as_dict(), TO_REDACT),
++		"entry": {
++			"domain": entry.domain,
++			"version": entry.version,
++			"minor_version": entry.minor_version,
++		},
+ 		"systems": [
+ 			_describe_system(system, index)
+ 			for index, system in enumerate(simplisafe.systems.values())
+@@ -50,41 +46,16 @@ def _describe_system(system: object, index: int) -> dict[str, Any]:
+ 		system_data["skip_reason"] = "unsupported_system_version"
+ 		return system_data
+ 
+-	system_data["cameras"] = [
+-		_describe_camera(camera)
+-		for camera in system.cameras.values()
+-	]
++	system_data["cameras"] = [_describe_camera(camera) for camera in system.cameras.values()]
+ 	return system_data
+ 
+ 
+ def _describe_camera(camera: Camera) -> dict[str, Any]:
+-	raw_provider, backend, supported, skip_reason = _describe_webrtc_provider(
+-		camera.camera_settings.get("admin")
+-	)
++	provider, backend, reason = describe_backend(camera.camera_settings)
+ 	return {
+-		"name": camera.name,
+-		"webRTCProvider": raw_provider,
+-		"backend": backend,
+-		"supported": supported,
+-		"skip_reason": skip_reason,
++		"camera_type": camera.camera_type.name.lower(),
++		"webRTCProvider": provider,
++		"backend": backend.value,
++		"supported": backend != CameraBackend.UNKNOWN,
++		"skip_reason": reason,
+ 	}
+-
+-
+-def _describe_webrtc_provider(
+-	settings: object,
+-) -> tuple[str | None, str, bool, str | None]:
+-	if not isinstance(settings, Mapping):
+-		return None, "unknown", False, "unexpected_settings_schema"
+-
+-	provider = settings.get("webRTCProvider")
+-	raw_provider = str(provider)
+-
+-	match provider:
+-		case "mist":
+-			return raw_provider, "livekit", True, None
+-		case "kvs":
+-			return raw_provider, "kinesis", True, None
+-		case None:
+-			return None, "unknown", False, "missing_webrtc_provider"
+-		case _:
+-			return raw_provider, "unknown", False, "unknown_webrtc_provider"
+diff --git a/custom_components/simplirtc/event.py b/custom_components/simplirtc/event.py
+index f8a0ff3e203a70c746f1d94c7ca48037adb9d595..09afab07e5d995c991683d6bd1d1c7479debfd4e 100644
+--- a/custom_components/simplirtc/event.py
++++ b/custom_components/simplirtc/event.py
+@@ -4,20 +4,19 @@ from __future__ import annotations
+ 
+ from typing import cast, override
+ 
+-from simplipy.device.camera import Camera
+-from simplipy.system.v3 import SystemV3
+-from simplipy.websocket import EVENT_CAMERA_MOTION_DETECTED, WebsocketEvent
+-
+ from homeassistant.components.event import (
+ 	EventDeviceClass,
+ 	EventEntity,
+ 	EventEntityDescription,
+ )
+-from homeassistant.config_entries import ConfigEntry
+ from homeassistant.components.simplisafe import SimpliSafe
+ from homeassistant.components.simplisafe.entity import SimpliSafeEntity
++from homeassistant.config_entries import ConfigEntry
+ from homeassistant.core import HomeAssistant, callback
+ from homeassistant.helpers.entity_platform import AddEntitiesCallback
++from simplipy.device.camera import Camera
++from simplipy.system.v3 import SystemV3
++from simplipy.websocket import EVENT_CAMERA_MOTION_DETECTED, WebsocketEvent
+ 
+ EVENT_TYPE_MOTION = "motion"
+ CAMERA_EVENT_SERIAL_KEYS = ("uuid", "serial")
+diff --git a/custom_components/simplirtc/kinesis.py b/custom_components/simplirtc/kinesis.py
+index 7bb6b21ae9754c0c525459ece691eaaf27914850..17302e8ad8d7efe83096554ddcc6c94990c5a77a 100644
+--- a/custom_components/simplirtc/kinesis.py
++++ b/custom_components/simplirtc/kinesis.py
+@@ -2,13 +2,13 @@
+ 
+ from __future__ import annotations
+ 
+-from abc import ABC
+ import asyncio
+ import base64
+-from collections.abc import Callable
+-from dataclasses import asdict
+ import json
+ import logging
++from abc import ABC
++from collections.abc import Callable
++from dataclasses import asdict
+ from secrets import token_hex
+ from typing import Any, override
+ 
+@@ -87,14 +87,12 @@ class KinesisSession(SimpliSafeWebRTCSession):
+ 			try:
+ 				await self._read()
+ 			except Exception as err:
+-				self._logger.error("Error in Kinesis session: %s", err)
++				self._logger.error("Kinesis signaling failed (%s)", type(err).__name__)
+ 			finally:
+ 				self._reader_task = None
+ 				self.close()
+ 
+-		self._reader_task = asyncio.create_task(
+-			reader_task(), name=f"simplirtc-kinesis-{self._id}"
+-		)
++		self._reader_task = asyncio.create_task(reader_task(), name=f"simplirtc-kinesis-{self._id}")
+ 
+ 	@override
+ 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
+@@ -146,21 +144,20 @@ class KinesisSession(SimpliSafeWebRTCSession):
+ 			ClientSession() as session,
+ 			session.ws_connect(self._channel_endpoint) as ws,
+ 		):
++
+ 			async def send_request(request: KinesisRequest) -> None:
+-				self._logger.debug("-> %s", request)
++				self._logger.debug("Sending Kinesis message kind=%s", request.action)
+ 				await ws.send_json(asdict(request))
+ 
+ 			await self._request_queue.flush(send_request)
+ 			async for msg in ws:
+-				self._logger.debug("<- %s", msg.data)
+-
+ 				if msg.data == "":
+ 					continue  # Ignore empty messages
+ 
+ 				try:
+ 					parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
+ 				except Exception:
+-					self._logger.exception("failed to parse message")
++					self._logger.warning("Failed to parse Kinesis signaling message")
+ 					continue
+ 
+ 				payload = parsed.payload
+@@ -170,10 +167,14 @@ class KinesisSession(SimpliSafeWebRTCSession):
+ 					case "SDP_ANSWER":
+ 						send_message(WebRTCAnswer(answer=payload["sdp"]))
+ 					case "ICE_CANDIDATE":
+-						send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+-							candidate=payload.get("candidate", ""),
+-							sdp_mid=payload.get("sdpMid"),
+-							sdp_m_line_index=payload.get("sdpMLineIndex"),
+-						)))
++						send_message(
++							WebRTCCandidate(
++								candidate=RTCIceCandidateInit(
++									candidate=payload.get("candidate", ""),
++									sdp_mid=payload.get("sdpMid"),
++									sdp_m_line_index=payload.get("sdpMLineIndex"),
++								)
++							)
++						)
+ 					case _:
+ 						continue
+diff --git a/custom_components/simplirtc/livekit.py b/custom_components/simplirtc/livekit.py
+index 0c91b898f780c2f9642b4af6f40144337b3dffd9..c7bc5c694f93eea37b497f1f31edb4afa0ce4cce 100644
+--- a/custom_components/simplirtc/livekit.py
++++ b/custom_components/simplirtc/livekit.py
+@@ -4,6 +4,11 @@ from __future__ import annotations
+ 
+ import asyncio
+ import base64
++import gzip
++import json
++import logging
++import time
++from collections import Counter
+ from collections.abc import (
+ 	AsyncGenerator,
+ 	AsyncIterator,
+@@ -11,11 +16,8 @@ from collections.abc import (
+ 	Iterable,
+ )
+ from contextlib import asynccontextmanager
+-import gzip
+-import json
+-import logging
++from dataclasses import dataclass, field
+ from secrets import token_hex
+-import time
+ from typing import Literal, TypeAlias, override
+ from urllib.parse import urlencode
+ 
+@@ -31,20 +33,13 @@ from homeassistant.components.camera import (
+ )
+ from webrtc_models import RTCIceCandidateInit
+ 
+-from .vendor.aiortc import (
+-	RTCBundlePolicy,
+-	RTCConfiguration,
+-	RTCIceServer,
+-	RTCPeerConnection,
+-	RTCSessionDescription,
+-)
+-from .vendor.aiortc.sdp import candidate_from_sdp
+ from .protobufs.livekit_models_pb2 import (
+ 	AUDIO,
+ 	CAMERA,
+-	ClientInfo,
+ 	MICROPHONE,
+ 	VIDEO,
++	ClientInfo,
++	ParticipantInfo,
+ )
+ from .protobufs.livekit_rtc_pb2 import (
+ 	ConnectionSettings,
+@@ -65,6 +60,14 @@ from .protobufs.livekit_rtc_pb2 import (
+ 	TrickleRequest,
+ 	WrappedJoinRequest,
+ )
++from .vendor.aiortc import (
++	RTCBundlePolicy,
++	RTCConfiguration,
++	RTCIceServer,
++	RTCPeerConnection,
++	RTCSessionDescription,
++)
++from .vendor.aiortc.sdp import candidate_from_sdp
+ from .webrtc import MessageQueue, SimpliSafeWebRTCSession
+ 
+ _LOGGER = logging.getLogger(__name__)
+@@ -76,6 +79,38 @@ _CAMERA_TRACK_KIND_BY_TYPE_SOURCE = {
+ 	(VIDEO, CAMERA): "video",
+ }
+ 
++
++@dataclass(frozen=True, slots=True)
++class LiveKitCredentialMetadata:
++	"""Unverified JWT claims used only for safe connection diagnostics."""
++
++	expires_at: int | None = None
++	issued_at: int | None = None
++	room: str | None = field(default=None, repr=False)
++	subject: str | None = field(default=None, repr=False)
++
++
++def read_credential_metadata(token: str) -> LiveKitCredentialMetadata:
++	"""Read an allowlist of local claims without logging or validating credentials."""
++	try:
++		if len(token) > 16384:
++			return LiveKitCredentialMetadata()
++		payload = token.split(".")[1]
++		claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
++		if not isinstance(claims, dict):
++			return LiveKitCredentialMetadata()
++		video = claims.get("video")
++		room = video.get("room") if isinstance(video, dict) else None
++		return LiveKitCredentialMetadata(
++			expires_at=claims.get("exp") if type(claims.get("exp")) is int else None,
++			issued_at=claims.get("iat") if type(claims.get("iat")) is int else None,
++			room=room if isinstance(room, str) else None,
++			subject=claims.get("sub") if isinstance(claims.get("sub"), str) else None,
++		)
++	except (ValueError, IndexError, UnicodeDecodeError, RecursionError):
++		return LiveKitCredentialMetadata()
++
++
+ SessionClosedCallback = Callable[[], None]
+ SendIceServers = Callable[[list[ICEServer]], None]
+ LiveKitSignalMessage: TypeAlias = (
+@@ -102,11 +137,27 @@ class LiveKitSignal:
+ 		ws: ClientWebSocketResponse,
+ 		logger: logging.Logger,
+ 		task_group: asyncio.TaskGroup,
++		credential_metadata: LiveKitCredentialMetadata | None = None,
+ 	) -> None:
+ 		self._ws = ws
+ 		self._logger = logger
+ 		self._task_group = task_group
+ 		self._ping_task: asyncio.Task[None] | None = None
++		self._credential_metadata = credential_metadata or LiveKitCredentialMetadata()
++		self._started_at = time.monotonic()
++		self._camera_video_tracks: dict[str, set[str]] = {}
++		self._camera_video_seen = False
++		self._participant_summary: tuple | None = None
++		self._pings_sent = 0
++		self._pongs_received = 0
++		self._last_pong_log_at: float | None = None
++		self._message_counts: Counter[str | None] = Counter()
++		self._kind_log_at: dict[str | None, float] = {}
++
++	@property
++	def camera_video_ended(self) -> bool:
++		"""Return whether previously published camera video is now absent."""
++		return self._camera_video_seen and not any(self._camera_video_tracks.values())
+ 
+ 	@classmethod
+ 	@asynccontextmanager
+@@ -136,6 +187,7 @@ class LiveKitSignal:
+ 				ws=ws,
+ 				logger=logger,
+ 				task_group=task_group,
++				credential_metadata=read_credential_metadata(token),
+ 			)
+ 
+ 	def __aiter__(self) -> AsyncIterator[LiveKitSignalMessage]:
+@@ -165,11 +217,15 @@ class LiveKitSignal:
+ 			compression=WrappedJoinRequest.GZIP,
+ 			join_request=gzip.compress(join_request.SerializeToString()),
+ 		)
+-		return f"{url.rstrip('/')}/rtc?{urlencode({
+-			'join_request': base64.urlsafe_b64encode(
+-				wrapped_join_request.SerializeToString()
+-			).decode(),
+-		})}"
++		return f"{url.rstrip('/')}/rtc?{
++			urlencode(
++				{
++					'join_request': base64.urlsafe_b64encode(
++						wrapped_join_request.SerializeToString()
++					).decode(),
++				}
++			)
++		}"
+ 
+ 	async def messages(self) -> AsyncIterator[LiveKitSignalMessage]:
+ 		"""Yield parsed LiveKit SignalResponse messages."""
+@@ -177,21 +233,21 @@ class LiveKitSignal:
+ 			if msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+ 				break
+ 			if msg.type != WSMsgType.BINARY:
+-				raise RuntimeError(
+-					f"LiveKit sent non-binary signaling message type={msg.type}"
+-				)
++				raise RuntimeError(f"LiveKit sent non-binary signaling message type={msg.type}")
+ 
+ 			try:
+ 				response = SignalResponse.FromString(msg.data)
+ 			except Exception as err:
+-				self._logger.error("Error parsing LiveKit SignalResponse: %s", err)
++				self._logger.error("Error parsing LiveKit SignalResponse (%s)", type(err).__name__)
+ 				continue
+ 
+ 			yield self._response_message(response)
+ 
+ 	def _response_message(
+-		self, response: SignalResponse,
++		self,
++		response: SignalResponse,
+ 	) -> LiveKitSignalMessage:
++		self._log_response_metadata(response)
+ 		match kind := response.WhichOneof("message"):
+ 			case "join":
+ 				self._start_ping(response.join.ping_interval)
+@@ -216,11 +272,178 @@ class LiveKitSignal:
+ 				return kind, response.pong_resp
+ 			case _:
+ 				self._logger.debug(
+-					"Unhandled LiveKit signaling response: %s",
+-					response,
++					"Unhandled LiveKit signaling response kind=%s",
++					kind,
+ 				)
+ 				return "response", response
+ 
++	def _log_response_metadata(self, response: SignalResponse) -> None:
++		"""Log state transitions and counts, never protobufs, identifiers, or SDP."""
++		elapsed = round(time.monotonic() - self._started_at, 1)
++		kind = response.WhichOneof("message")
++		self._message_counts[kind] += 1
++		if kind == "join":
++			join = response.join
++			claims = self._credential_metadata
++			self._logger.info(
++				"LiveKit joined elapsed_s=%s ping_interval_s=%s ping_timeout_s=%s "
++				"subscriber_primary=%s claimed_room_matches=%s claimed_subject_matches=%s",
++				elapsed,
++				join.ping_interval,
++				join.ping_timeout,
++				join.subscriber_primary,
++				join.room.name == claims.room if claims.room is not None else None,
++				join.participant.identity == claims.subject if claims.subject is not None else None,
++			)
++			self._log_participants(join.other_participants, elapsed)
++		elif kind == "update":
++			self._log_participants(response.update.participants, elapsed)
++		elif kind == "subscription_permission_update":
++			allowed = response.subscription_permission_update.allowed
++			log = self._logger.info if allowed else self._logger.warning
++			log("LiveKit subscription permission elapsed_s=%s allowed=%s", elapsed, allowed)
++		elif kind == "subscription_response":
++			if response.subscription_response.err:
++				self._logger.warning(
++					"LiveKit subscription response elapsed_s=%s error_code=%s",
++					elapsed,
++					int(response.subscription_response.err),
++				)
++		elif kind == "stream_state_update":
++			states = sorted(
++				Counter(int(s.state) for s in response.stream_state_update.stream_states).items()
++			)
++			self._logger.info(
++				"LiveKit media stream states elapsed_s=%s state_counts=%s", elapsed, states
++			)
++		elif kind == "leave":
++			self._logger.warning(
++				"LiveKit leave elapsed_s=%s action_code=%s reason_code=%s can_reconnect=%s",
++				elapsed,
++				int(response.leave.action),
++				int(response.leave.reason),
++				response.leave.can_reconnect,
++			)
++		elif kind in {"room_moved", "refresh_token"}:
++			metadata = read_credential_metadata(
++				response.room_moved.token if kind == "room_moved" else response.refresh_token
++			)
++			claims = self._credential_metadata
++			self._logger.info(
++				"LiveKit credential/session event elapsed_s=%s kind=%s same_room=%s "
++				"same_subject=%s claimed_credential_lifetime_s=%s claimed_credential_expires_in_s=%s",
++				elapsed,
++				kind,
++				metadata.room == claims.room
++				if claims.room is not None and metadata.room is not None
++				else None,
++				metadata.subject == claims.subject
++				if claims.subject is not None and metadata.subject is not None
++				else None,
++				metadata.expires_at - metadata.issued_at
++				if metadata.expires_at is not None and metadata.issued_at is not None
++				else None,
++				metadata.expires_at - int(time.time()) if metadata.expires_at is not None else None,
++			)
++		elif kind in {"track_unpublished", "mute", "reconnect"}:
++			self._logger.info("LiveKit media/session event elapsed_s=%s kind=%s", elapsed, kind)
++		elif kind == "media_sections_requirement":
++			self._logger.info(
++				"LiveKit media sections required elapsed_s=%s audio_sections=%s video_sections=%s",
++				elapsed,
++				response.media_sections_requirement.num_audios,
++				response.media_sections_requirement.num_videos,
++			)
++		elif kind in {"offer", "answer"}:
++			sdp = getattr(response, kind).sdp
++			self._logger.info(
++				"LiveKit description elapsed_s=%s kind=%s audio_sections=%s video_sections=%s",
++				elapsed,
++				kind,
++				sum(line.startswith("m=audio ") for line in sdp.splitlines()),
++				sum(line.startswith("m=video ") for line in sdp.splitlines()),
++			)
++		elif kind in {"pong_resp", "pong"}:
++			self._pongs_received += 1
++			now = time.monotonic()
++			if self._last_pong_log_at is None or now - self._last_pong_log_at >= 60:
++				self._last_pong_log_at = now
++				self._logger.info(
++					"LiveKit signaling alive elapsed_s=%s pings_sent=%s pongs_received=%s",
++					elapsed,
++					self._pings_sent,
++					self._pongs_received,
++				)
++		else:
++			now = time.monotonic()
++			if kind not in self._kind_log_at or now - self._kind_log_at[kind] >= 60:
++				self._kind_log_at[kind] = now
++				self._logger.info(
++					"LiveKit response metadata elapsed_s=%s kind=%s count=%s",
++					elapsed,
++					kind,
++					self._message_counts[kind],
++				)
++
++	def _log_participants(self, participants: Iterable[ParticipantInfo], elapsed: float) -> None:
++		participants = list(participants)
++		before = sum(len(tracks) for tracks in self._camera_video_tracks.values())
++		tracks_changed = False
++		for participant in participants:
++			key = participant.sid or participant.identity
++			if not key:
++				continue
++			if participant.state == ParticipantInfo.DISCONNECTED:
++				tracks_changed |= bool(self._camera_video_tracks.get(key))
++				self._camera_video_tracks.pop(key, None)
++			else:
++				videos = {
++					track.sid
++					for track in participant.tracks
++					if track.type == VIDEO and track.source == CAMERA and track.sid
++				}
++				tracks_changed |= self._camera_video_tracks.get(key, set()) != videos
++				self._camera_video_tracks[key] = videos
++		after = sum(len(tracks) for tracks in self._camera_video_tracks.values())
++		self._camera_video_seen |= after > 0
++		states = sorted(Counter(int(p.state) for p in participants).items())
++		tracks = [track for participant in participants for track in participant.tracks]
++		videos = [track for track in tracks if track.type == VIDEO and track.source == CAMERA]
++		summary = (
++			states,
++			sum(p.is_publisher for p in participants),
++			sum(track.type == AUDIO and track.source == MICROPHONE for track in tracks),
++			len(videos),
++			sum(track.muted for track in videos),
++			after,
++		)
++		if summary != self._participant_summary or tracks_changed:
++			self._participant_summary = summary
++			self._logger.info(
++				"LiveKit participant update elapsed_s=%s state_counts=%s publishers=%s "
++				"updated_camera_audio=%s updated_camera_video=%s muted_camera_video=%s "
++				"active_camera_video=%s camera_video_tracks_changed=%s",
++				elapsed,
++				*summary,
++				tracks_changed,
++			)
++		if before > after:
++			reasons = sorted(
++				Counter(
++					int(p.disconnect_reason)
++					for p in participants
++					if p.state == ParticipantInfo.DISCONNECTED
++				).items()
++			)
++			self._logger.warning(
++				"LiveKit camera video tracks removed elapsed_s=%s removed=%s remaining=%s "
++				"disconnect_reason_counts=%s",
++				elapsed,
++				before - after,
++				after,
++				reasons,
++			)
++
+ 	async def send(self, request: SignalRequest) -> None:
+ 		"""Send a protobuf request on this websocket."""
+ 		if self._ws.closed:
+@@ -229,9 +452,7 @@ class LiveKitSignal:
+ 
+ 	def _start_ping(self, interval_seconds: int) -> None:
+ 		if interval_seconds <= 0:
+-			raise RuntimeError(
+-				f"LiveKit join had invalid ping_interval={interval_seconds}"
+-			)
++			raise RuntimeError(f"LiveKit join had invalid ping_interval={interval_seconds}")
+ 		if self._ping_task is not None:
+ 			return
+ 		self._ping_task = self._task_group.create_task(
+@@ -243,13 +464,12 @@ class LiveKitSignal:
+ 		try:
+ 			while not self._ws.closed:
+ 				await asyncio.sleep(interval_seconds)
+-				await self.send(
+-					SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000)))
+-				)
++				await self.send(SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000))))
++				self._pings_sent += 1
+ 		except asyncio.CancelledError:
+ 			raise
+ 		except Exception as err:
+-			self._logger.error("LiveKit ping failed: %s", err)
++			self._logger.error("LiveKit ping failed (%s)", type(err).__name__)
+ 			raise
+ 		finally:
+ 			self._ping_task = None
+@@ -267,23 +487,23 @@ class WarmupSession:
+ 		self._signal = signal
+ 		self._logger = _LOGGER.getChild("warmup")
+ 
+-		self._peer_connection = RTCPeerConnection(configuration=RTCConfiguration(
+-			iceServers=[
+-				RTCIceServer(
+-					urls=list(ice_server.urls),
+-					username=ice_server.username or None,
+-					credential=ice_server.credential or None,
+-				)
+-				for ice_server in ice_servers
+-			],
+-			bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
+-		))
++		self._peer_connection = RTCPeerConnection(
++			configuration=RTCConfiguration(
++				iceServers=[
++					RTCIceServer(
++						urls=list(ice_server.urls),
++						username=ice_server.username or None,
++						credential=ice_server.credential or None,
++					)
++					for ice_server in ice_servers
++				],
++				bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
++			)
++		)
+ 		self._peer_connection.addTransceiver("audio", direction="recvonly")
+ 		self._peer_connection.addTransceiver("video", direction="recvonly")
+ 
+-		self._waiting_for_track_permissions = set(
+-			_CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values()
+-		)
++		self._waiting_for_track_permissions = set(_CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values())
+ 		self._track_sid_by_kind: dict[str, str] = {}
+ 		self._allowed_track_sids: set[str] = set()
+ 
+@@ -306,17 +526,15 @@ class WarmupSession:
+ 					case ("subscription_response", response):
+ 						if response.err:
+ 							self._logger.warning(
+-								"LiveKit aiortc warmup subscription failed: track=%s error=%s",
+-								response.track_sid,
++								"LiveKit aiortc warmup subscription failed: error_code=%s",
+ 								response.err,
+ 							)
+ 					case ("pong_resp", _):
+ 						pass
+ 					case (kind, response):
+ 						self._logger.debug(
+-							"Unhandled LiveKit aiortc warmup message kind=%s response=%s",
++							"Unhandled LiveKit aiortc warmup message kind=%s",
+ 							kind,
+-							response,
+ 						)
+ 
+ 				if not self._waiting_for_track_permissions:
+@@ -370,9 +588,7 @@ class WarmupSession:
+ 		sdp_mid = init.get("sdpMid")
+ 		sdp_m_line_index = init.get("sdpMLineIndex")
+ 		candidate.sdpMid = sdp_mid if isinstance(sdp_mid, str) else None
+-		candidate.sdpMLineIndex = (
+-			sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+-		)
++		candidate.sdpMLineIndex = sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+ 		await self._peer_connection.addIceCandidate(candidate)
+ 
+ 	def _on_participant_update(self, update: ParticipantUpdate) -> None:
+@@ -382,9 +598,7 @@ class WarmupSession:
+ 			for track in participant.tracks:
+ 				if not track.sid:
+ 					continue
+-				if track_kind := _CAMERA_TRACK_KIND_BY_TYPE_SOURCE.get(
+-					(track.type, track.source)
+-				):
++				if track_kind := _CAMERA_TRACK_KIND_BY_TYPE_SOURCE.get((track.type, track.source)):
+ 					self._track_sid_by_kind[track_kind] = track.sid
+ 					if track.sid in self._allowed_track_sids:
+ 						self._waiting_for_track_permissions.discard(track_kind)
+@@ -410,6 +624,7 @@ class WarmupSession:
+ 				return track_kind
+ 		return None
+ 
++
+ class LiveKitSession(SimpliSafeWebRTCSession):
+ 	"""A browser-offer LiveKit signaling session for Home Assistant."""
+ 
+@@ -419,6 +634,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 		livekit_url: str,
+ 		user_token: str,
+ 		send_ice_servers: SendIceServers,
++		stream_logger: logging.Logger | None = None,
+ 	) -> None:
+ 		self._livekit_url = livekit_url
+ 		self._user_token = user_token
+@@ -426,11 +642,18 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 		self._id = token_hex(4)
+ 		self._send_message: WebRTCSendMessage | None = None
+ 		self._on_close: SessionClosedCallback | None = None
+-		self._logger = _LOGGER.getChild(f"session.{self._id}")
++		self._logger = (stream_logger or _LOGGER).getChild(f"session.{self._id}")
+ 
+ 		self._offer_sdp: str | None = None
++		self._started_at = time.monotonic()
+ 		self._reader_task: asyncio.Task[None] | None = None
+ 		self._request_queue = MessageQueue[SignalRequest]()
++		self._camera_video_ended = False
++
++	@property
++	def camera_video_ended(self) -> bool:
++		"""Return whether the camera publisher ended this browser's live view."""
++		return self._camera_video_ended
+ 
+ 	@override
+ 	def start(self, on_close: SessionClosedCallback) -> None:
+@@ -444,8 +667,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 			try:
+ 				await self._read()
+ 			except Exception as err:
+-				self._logger.error("Error in LiveKit session: %s", err)
++				self._logger.error("LiveKit signaling failed (%s)", type(err).__name__)
+ 			finally:
++				self._logger.info(
++					"LiveKit session ended elapsed_s=%s",
++					round(time.monotonic() - self._started_at, 1),
++				)
+ 				self._reader_task = None
+ 				self.close()
+ 
+@@ -461,10 +688,14 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 			raise RuntimeError(f"LiveKit session {self._id} was not started")
+ 		self._send_message = send_message
+ 		self._offer_sdp = offer_sdp
+-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+-			type="offer",
+-			sdp=offer_sdp,
+-		)))
++		await self._request_queue.add(
++			SignalRequest(
++				offer=SessionDescription(
++					type="offer",
++					sdp=offer_sdp,
++				)
++			)
++		)
+ 
+ 	@override
+ 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
+@@ -480,12 +711,14 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 		if candidate.sdp_m_line_index is not None:
+ 			candidate_init["sdpMLineIndex"] = candidate.sdp_m_line_index
+ 
+-		await self._request_queue.add(SignalRequest(
+-			trickle=TrickleRequest(
+-				candidateInit=json.dumps(candidate_init, separators=(",", ":")),
+-				target=SignalTarget.PUBLISHER,
+-			),
+-		))
++		await self._request_queue.add(
++			SignalRequest(
++				trickle=TrickleRequest(
++					candidateInit=json.dumps(candidate_init, separators=(",", ":")),
++					target=SignalTarget.PUBLISHER,
++				),
++			)
++		)
+ 
+ 	@override
+ 	def close(self) -> None:
+@@ -524,8 +757,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 
+ 			if all(
+ 				any(
+-					track.sid
+-					and (track.type, track.source) == required_track
++					track.sid and (track.type, track.source) == required_track
+ 					for participant in join.other_participants
+ 					for track in participant.tracks
+ 				)
+@@ -536,11 +768,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 				return
+ 
+ 			try:
+-				await WarmupSession(signal, ice_servers=ice_servers).run()
++				async with asyncio.timeout(20):
++					await WarmupSession(signal, ice_servers=ice_servers).run()
+ 			except Exception as err:
+ 				self._logger.warning(
+-					"LiveKit aiortc warmup failed; continuing with browser offer: %s",
+-					err,
++					"LiveKit aiortc warmup failed; continuing with browser offer (%s)",
++					type(err).__name__,
+ 				)
+ 
+ 		async with LiveKitSignal.connect(
+@@ -564,6 +797,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 					self._on_trickle(trickle)
+ 				case ("media_sections_requirement", requirement):
+ 					await self._on_media_sections_requirement(requirement)
++				case ("update", _):
++					if signal.camera_video_ended:
++						self._camera_video_ended = True
++						self._logger.info("LiveKit camera video ended; closing browser signaling")
++						self.close()
++						return
+ 				case ("leave", leave):
+ 					self._logger.warning(
+ 						"LiveKit browser signal left: reason=%s",
+@@ -572,17 +811,15 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 				case ("subscription_response", response):
+ 					if response.err:
+ 						self._logger.warning(
+-							"LiveKit browser subscription failed: track=%s error=%s",
+-							response.track_sid,
++							"LiveKit browser subscription failed: error_code=%s",
+ 							response.err,
+ 						)
+ 				case ("pong_resp", _):
+ 					pass
+ 				case (kind, response):
+ 					self._logger.debug(
+-						"Unhandled LiveKit browser message kind=%s response=%s",
++						"Unhandled LiveKit browser message kind=%s",
+ 						kind,
+-						response,
+ 					)
+ 
+ 		if not self._request_queue.flushed:
+@@ -598,11 +835,15 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 
+ 		if trickle.final and not trickle.candidateInit:
+ 			if send_message := self._send_message:
+-				send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+-					candidate="",
+-					sdp_mid=None,
+-					sdp_m_line_index=None,
+-				)))
++				send_message(
++					WebRTCCandidate(
++						candidate=RTCIceCandidateInit(
++							candidate="",
++							sdp_mid=None,
++							sdp_m_line_index=None,
++						)
++					)
++				)
+ 			return
+ 		if not trickle.candidateInit:
+ 			return
+@@ -620,24 +861,34 @@ class LiveKitSession(SimpliSafeWebRTCSession):
+ 		sdp_mid = candidate_init.get("sdpMid")
+ 		sdp_m_line_index = candidate_init.get("sdpMLineIndex")
+ 		if send_message := self._send_message:
+-			send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+-				candidate=candidate,
+-				sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
+-				sdp_m_line_index=(
+-					sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+-				),
+-			)))
++			send_message(
++				WebRTCCandidate(
++					candidate=RTCIceCandidateInit(
++						candidate=candidate,
++						sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
++						sdp_m_line_index=(
++							sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
++						),
++					)
++				)
++			)
+ 
+ 	async def _on_media_sections_requirement(
+ 		self,
+ 		requirement: MediaSectionsRequirement,
+ 	) -> None:
+ 		if requirement.num_audios or requirement.num_videos:
+-			self._logger.warning(f"LiveKit requested extra media sections audio={requirement.num_audios} video={requirement.num_videos}; Home Assistant cannot apply renegotiation")
++			self._logger.warning(
++				f"LiveKit requested extra media sections audio={requirement.num_audios} video={requirement.num_videos}; Home Assistant cannot apply renegotiation"
++			)
+ 		if self._offer_sdp is None:
+ 			self._logger.warning("LiveKit requested media sections before browser offer")
+ 			return
+-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+-			type="offer",
+-			sdp=self._offer_sdp,
+-		)))
++		await self._request_queue.add(
++			SignalRequest(
++				offer=SessionDescription(
++					type="offer",
++					sdp=self._offer_sdp,
++				)
++			)
++		)
+diff --git a/custom_components/simplirtc/manifest.json b/custom_components/simplirtc/manifest.json
+index 5c9c6f75e8771871a9bac0be68d7518fdd669279..3f66e1c344d77cf51f7384271ba3319d9662737e 100644
+--- a/custom_components/simplirtc/manifest.json
++++ b/custom_components/simplirtc/manifest.json
+@@ -1,17 +1,20 @@
+ {
+   "domain": "simplirtc",
+-  "name": "Simplisafe WebRTC Cameras",
++  "name": "SimpliSafe Camera Streaming",
+   "dependencies": [
+-    "simplisafe"
++    "simplisafe",
++    "stream"
+   ],
+   "requirements": [
+     "aioice>=0.10.1,<1.0.0",
+-    "av>=14.0.0,<18.0.0",
++    "av>=14.0.0,<20.0.0",
+     "cryptography>=44.0.0",
+     "google-crc32c>=1.1",
+-    "pyee>=13.0.0",
++    "pyee>=13.0.0,<15.0.0",
+     "pylibsrtp>=0.10.0",
+-    "pyopenssl>=25.0.0"
++    "pyopenssl>=25.0.0",
++    "pydantic>=2.8.0,<3.0.0",
++    "protobuf>=6.32.0,<8.0.0"
+   ],
+   "codeowners": [
+     "gilliginsisland"
+@@ -21,5 +24,5 @@
+   "iot_class": "cloud_polling",
+   "documentation": "https://github.com/gilliginsisland/hass-simplirtc",
+   "issue_tracker": "https://github.com/gilliginsisland/hass-simplirtc/issues",
+-  "version": "1.0"
++  "version": "1.1.3"
+ }
+diff --git a/custom_components/simplirtc/webrtc.py b/custom_components/simplirtc/webrtc.py
+index 80efe1cb47b40f7d58365aa345bc7f4662babaf2..554c1652003a6e64a243db2ec8a974b6da5ee290 100644
+--- a/custom_components/simplirtc/webrtc.py
++++ b/custom_components/simplirtc/webrtc.py
+@@ -2,11 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ from abc import ABC, abstractmethod
+ from collections.abc import Awaitable, Callable
+ from contextvars import ContextVar
+ from functools import wraps
+-import logging
+ from typing import Any, Generic, TypeVar
+ 
+ from homeassistant.components import websocket_api
+@@ -16,6 +16,7 @@ from homeassistant.components.camera import (
+ )
+ from homeassistant.components.camera.helper import get_camera_from_entity_id
+ from homeassistant.core import HomeAssistant, callback
++from homeassistant.exceptions import HomeAssistantError
+ from webrtc_models import RTCIceCandidateInit
+ 
+ _LOGGER = logging.getLogger(__name__)
+@@ -88,15 +89,11 @@ class SimpliSafeWebRTCSession(ABC):
+ 		"""Close the session."""
+ 
+ 
+-async def async_register_webrtc_client_config_handler(
+-	hass: HomeAssistant, _component: str
+-) -> None:
++async def async_register_webrtc_client_config_handler(hass: HomeAssistant, _component: str) -> None:
+ 	"""Replace a registered Home Assistant websocket handler with a wrapped one."""
+ 	command = "camera/webrtc/get_client_config"
+ 
+-	if (
+-		handlers := hass.data.get(websocket_api.DOMAIN)
+-	) is None or command not in handlers:
++	if (handlers := hass.data.get(websocket_api.DOMAIN)) is None or command not in handlers:
+ 		_LOGGER.warning("Cannot wrap missing Home Assistant websocket command %s", command)
+ 		return
+ 
+@@ -120,7 +117,11 @@ async def async_register_webrtc_client_config_handler(
+ 		if async_prepare_config := getattr(
+ 			camera, "async_prepare_webrtc_client_configuration", None
+ 		):
+-			config = await async_prepare_config()
++			try:
++				config = await async_prepare_config()
++			except HomeAssistantError as err:
++				connection.send_error(msg["id"], "webrtc_get_client_config_failed", str(err))
++				return
+ 
+ 		token = _webrtc_client_configuration.set(config)
+ 		try:
+diff --git a/custom_components/simplirtc/backend.py b/custom_components/simplirtc/backend.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9a757f3bf128a3aa3d82cb91f1ec33a219966c1
+--- /dev/null
++++ b/custom_components/simplirtc/backend.py
+@@ -0,0 +1,29 @@
++"""Select a camera transport without guessing unknown provider contracts."""
++
++from collections.abc import Mapping
++from enum import StrEnum
++from typing import Any
++
++
++class CameraBackend(StrEnum):
++	LEGACY = "flv"
++	KINESIS = "kinesis"
++	LIVEKIT = "livekit"
++	UNKNOWN = "unknown"
++
++
++def describe_backend(settings: object) -> tuple[str | None, CameraBackend, str | None]:
++	"""Describe a camera's provider, including older cameras without admin data."""
++	if not isinstance(settings, Mapping):
++		return None, CameraBackend.UNKNOWN, "unexpected_settings_schema"
++	admin: Any = settings.get("admin")
++	if admin is not None and not isinstance(admin, Mapping):
++		return None, CameraBackend.UNKNOWN, "unexpected_settings_schema"
++	provider = admin.get("webRTCProvider") if admin else None
++	if provider is None or provider == "simplisafe":
++		return provider, CameraBackend.LEGACY, None
++	if provider == "kvs":
++		return provider, CameraBackend.KINESIS, None
++	if provider == "mist":
++		return provider, CameraBackend.LIVEKIT, None
++	return str(provider), CameraBackend.UNKNOWN, "unknown_webrtc_provider"
+diff --git a/custom_components/simplirtc/legacy.py b/custom_components/simplirtc/legacy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d25c19c5a82a4400a5752075316ad67027a3b5eb
+--- /dev/null
++++ b/custom_components/simplirtc/legacy.py
+@@ -0,0 +1,119 @@
++"""Authenticated HTTPS FLV relay for Home Assistant's local stream decoder."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from hmac import compare_digest
++from secrets import token_urlsafe
++from typing import Any
++from urllib.parse import quote
++
++from aiohttp import ClientTimeout, web
++from simplipy.const import DEFAULT_USER_AGENT
++
++_LOGGER = logging.getLogger(__name__)
++
++
++class LegacyStreamRelay:
++	"""Serve FLV only on loopback, keeping OAuth out of stream URLs and options."""
++
++	def __init__(self, api: Any, camera_uuid: str) -> None:
++		self._api = api
++		self._upstream = f"https://media.simplisafe.com/v1/{quote(camera_uuid, safe='')}/flv?x=1280&audioEncoding=AAC"
++		self._token = token_urlsafe(32)
++		self._runner: web.AppRunner | None = None
++		self._source: str | None = None
++		self._lock = asyncio.Lock()
++		self._requests: set[asyncio.Task] = set()
++		self._closed = False
++
++	async def source(self) -> str:
++		"""Start the private listener once; do not wake a camera until playback."""
++		async with self._lock:
++			if self._closed:
++				raise RuntimeError("Camera relay has been unloaded")
++			if self._source is not None:
++				return self._source
++			app = web.Application()
++			app.router.add_get("/stream", self._handle_stream)
++			runner = web.AppRunner(
++				app, access_log=None, shutdown_timeout=5, handler_cancellation=True
++			)
++			await runner.setup()
++			try:
++				site = web.TCPSite(runner, "127.0.0.1", 0)
++				await site.start()
++				port = runner.addresses[0][1]
++			except BaseException:
++				await runner.cleanup()
++				raise
++			self._runner = runner
++			self._source = f"http://127.0.0.1:{port}/stream?token={self._token}"
++			return self._source
++
++	async def close(self) -> None:
++		"""Cancel open upstream requests and release the private listener."""
++		async with self._lock:
++			self._closed = True
++			requests = tuple(self._requests)
++			for task in requests:
++				task.cancel()
++			await asyncio.gather(*requests, return_exceptions=True)
++			if self._runner is not None:
++				await self._runner.cleanup()
++				self._runner = None
++			self._source = None
++
++	async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
++		token = request.query.get("token", "")
++		if self._closed or not compare_digest(token, self._token):
++			raise web.HTTPForbidden()
++		task = asyncio.current_task()
++		assert task is not None
++		self._requests.add(task)
++		try:
++			return await self._proxy(request)
++		except asyncio.CancelledError:
++			raise
++		except (ConnectionError, asyncio.TimeoutError):
++			raise web.HTTPBadGateway(text="Camera stream disconnected") from None
++		except Exception as err:
++			_LOGGER.warning("Legacy camera stream failed (%s)", type(err).__name__)
++			raise web.HTTPBadGateway(text="Unable to open SimpliSafe camera live view") from None
++		finally:
++			self._requests.discard(task)
++
++	async def _proxy(self, request: web.Request) -> web.StreamResponse:
++		async with asyncio.timeout(20):
++			await self._api.async_request("get", "api/authCheck")
++		for attempt in range(2):
++			if not self._api.access_token:
++				raise web.HTTPBadGateway(text="Camera authentication is unavailable")
++			async with self._api.session.get(
++				self._upstream,
++				headers={
++					"Authorization": f"Bearer {self._api.access_token}",
++					"User-Agent": DEFAULT_USER_AGENT,
++				},
++				timeout=ClientTimeout(total=None, connect=10, sock_read=30),
++				allow_redirects=False,
++			) as upstream:
++				if upstream.status == 401 and attempt == 0:
++					async with asyncio.timeout(20):
++						await self._api.async_refresh_access_token()
++					continue
++				if upstream.status != 200:
++					raise web.HTTPBadGateway(text="SimpliSafe camera live view is unavailable")
++				response = web.StreamResponse(
++					headers={
++						"Content-Type": "video/x-flv",
++						"Cache-Control": "no-store",
++					}
++				)
++				await response.prepare(request)
++				async for chunk in upstream.content.iter_chunked(64 * 1024):
++					await response.write(chunk)
++				await response.write_eof()
++				return response
++		raise web.HTTPBadGateway(text="Camera authentication failed")
+diff --git a/custom_components/simplirtc/security.py b/custom_components/simplirtc/security.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b63be2f30e1d6c6978b0e0ed7699eb3615ddecfb
+--- /dev/null
++++ b/custom_components/simplirtc/security.py
+@@ -0,0 +1,25 @@
++"""Prevent the stock simplipy debug logger from exposing live-view credentials."""
++
++import logging
++
++
++class LiveViewLogFilter(logging.Filter):
++	"""Redact only the live-view response log emitted by released simplipy."""
++
++	def filter(self, record: logging.LogRecord) -> bool:
++		if (
++			record.msg == "Data received from /%s: %s"
++			and isinstance(record.args, tuple)
++			and len(record.args) == 2
++			and isinstance(record.args[0], str)
++			and (record.args[0].endswith("/live-view") or record.args[0] == "oauth/token")
++		):
++			record.args = (record.args[0], "[credential response redacted]")
++		return True
++
++
++def redact_live_view_logging() -> None:
++	"""Install an idempotent, endpoint-specific filter for the shared API logger."""
++	logger = logging.getLogger("simplipy")
++	if not any(isinstance(item, LiveViewLogFilter) for item in logger.filters):
++		logger.addFilter(LiveViewLogFilter())
+diff --git a/frontend/simplisafe-camera-live.js b/frontend/simplisafe-camera-live.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..477c102422964220dbba1baa6580ac464c6f741e
+--- /dev/null
++++ b/frontend/simplisafe-camera-live.js
+@@ -0,0 +1,319 @@
++/* A visible-only recovery wrapper around Home Assistant's native camera card.
++ * It never opens a stream itself: removing/recreating the native card lets HA
++ * close the old session and obtain a new one through its normal camera flow.
++ */
++const CAMERA_CHECK_MS = 2000;
++const CAMERA_STARTUP_MS = 60000;
++const CAMERA_STALL_MS = 30000;
++const CAMERA_STABLE_MS = 30000;
++const CAMERA_RETRY_MAX_MS = 30000;
++const CAMERA_FAILED_STARTS_MAX = 6;
++
++function cameraElements(root) {
++  const result = [];
++  const roots = root.shadowRoot ? [root, root.shadowRoot] : [root];
++  while (roots.length) {
++    for (const element of roots.pop().querySelectorAll("*")) {
++      result.push(element);
++      if (element.shadowRoot) roots.push(element.shadowRoot);
++    }
++  }
++  return result;
++}
++
++function cameraElementVisible(element) {
++  // HA may keep an alternative HLS/WebRTC player mounted with display:none.
++  // Follow composed ancestors: parentElement stops at a shadow-root boundary.
++  for (let current = element; current; current = current.parentElement || current.getRootNode().host) {
++    if (current.hidden) return false;
++    const style = getComputedStyle(current);
++    if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
++  }
++  return true;
++}
++
++class SimpliSafeCameraLive extends HTMLElement {
++  constructor() {
++    super();
++    this.attachShadow({ mode: "open" });
++    const style = document.createElement("style");
++    style.textContent = `
++      :host { display: block; }
++      .frame { position: relative; width: 100%; aspect-ratio: var(--camera-ratio, 16 / 9); }
++      .card { width: 100%; }
++      .status { position: absolute; inset: 0; display: flex; align-items: center;
++        justify-content: center; flex-direction: column; gap: 12px;
++        padding: 16px; box-sizing: border-box; border-radius: var(--ha-card-border-radius, 12px);
++        color: var(--primary-text-color); background: var(--ha-card-background, var(--card-background-color));
++        font: inherit; text-align: center; pointer-events: none; }
++      .status[hidden] { display: none; }
++      button { font: inherit; padding: 8px 16px; border-radius: 8px;
++        border: 1px solid var(--divider-color); cursor: pointer; pointer-events: auto;
++        color: var(--primary-text-color); background: var(--card-background-color); }
++      button[hidden] { display: none; }
++    `;
++    this._frame = document.createElement("div");
++    this._frame.className = "frame";
++    this._slot = document.createElement("div");
++    this._slot.className = "card";
++    this._status = document.createElement("div");
++    this._status.className = "status";
++    this._status.setAttribute("role", "status");
++    this._status.setAttribute("aria-live", "polite");
++    this._message = document.createElement("span");
++    this._retryButton = document.createElement("button");
++    this._retryButton.type = "button";
++    this._retryButton.textContent = "Retry";
++    this._retryButton.hidden = true;
++    this._retryButton.addEventListener("click", () => {
++      if (!this._visible() || !this._available()) return;
++      this._failures = 0;
++      this._retryStopped = false;
++      this._pause();
++      this._reconcile();
++    });
++    this._status.append(this._message, this._retryButton);
++    this._frame.append(this._slot, this._status);
++    this.shadowRoot.append(style, this._frame);
++    this._generation = 0;
++    this._failures = 0;
++    this._reconnects = 0;
++    this._intersecting = false;
++    this._visibilityChanged = () => this._reconcile();
++    // Custom-element construction may initialize shadow content, but adding
++    // attributes to the host here would make document.createElement fail.
++    // Host status is first set by connectedCallback's reconciliation.
++    this._message.textContent = "Connecting…";
++  }
++
++  setConfig(config) {
++    if (!config || typeof config.entity !== "string" || !/^camera\.[a-zA-Z0-9_]+$/.test(config.entity)) {
++      throw new Error("A camera entity is required");
++    }
++    this._config = {
++      ...config,
++      type: "picture-entity",
++      camera_view: "live",
++      aspect_ratio: config.aspect_ratio || "16:9",
++      show_state: false,
++    };
++    const ratio = String(this._config.aspect_ratio).split(/[:/]/).map(Number);
++    const width = ratio[0];
++    const height = ratio.length === 1 ? 1 : ratio[1];
++    this._frame.style.setProperty("--camera-ratio", width > 0 && height > 0 && Number.isFinite(width / height) ? `${width} / ${height}` : "16 / 9");
++    this._pause();
++    this._failures = 0;
++    this._retryStopped = false;
++    this._reconcile();
++  }
++
++  set hass(value) {
++    this._hass = value;
++    if (this._card) this._card.hass = value;
++    this._reconcile();
++  }
++
++  get hass() { return this._hass; }
++  getCardSize() { return this._card?.getCardSize?.() ?? 3; }
++
++  connectedCallback() {
++    document.addEventListener("visibilitychange", this._visibilityChanged);
++    if (typeof IntersectionObserver === "function") {
++      this._observer = new IntersectionObserver((entries) => {
++        for (const entry of entries) {
++          if (entry.target === this) this._intersecting = entry.isIntersecting;
++        }
++        this._reconcile();
++      });
++      this._observer.observe(this);
++    } else {
++      this._intersecting = true;
++    }
++    this._reconcile();
++  }
++
++  disconnectedCallback() {
++    document.removeEventListener("visibilitychange", this._visibilityChanged);
++    this._observer?.disconnect();
++    this._observer = undefined;
++    this._intersecting = false;
++    this._pause();
++  }
++
++  _visible() {
++    return this.isConnected && this._intersecting && !this.hidden && !document.hidden;
++  }
++
++  _available() {
++    const state = this._hass?.states?.[this._config?.entity]?.state;
++    return typeof state === "string" && state.length > 0 && state !== "unavailable" && state !== "unknown";
++  }
++
++  _reconcile() {
++    if (!this._visible()) {
++      this._pause();
++      this._showStatus("paused", "");
++    } else if (!this._available()) {
++      this._pause();
++      this._showStatus("unavailable", "Camera unavailable");
++    } else if (this._retryStopped) {
++      this._showStatus("failed", "Live view could not reconnect");
++    } else if (this._config && this._hass && !this._card && !this._mounting && !this._retryTimer) {
++      void this._mount();
++    }
++  }
++
++  async _mount() {
++    if (!this._visible() || !this._available()) return;
++    const generation = ++this._generation;
++    this._mounting = true;
++    this._startedAt = performance.now();
++    this._lastProgressAt = this._startedAt;
++    this._stableSince = undefined;
++    this._hasValidFrames = false;
++    this._showStatus("starting", "Connecting…");
++    this._watchTimer = setInterval(() => this._check(), CAMERA_CHECK_MS);
++    try {
++      let card;
++      if (typeof globalThis.loadCardHelpers === "function") {
++        const helpers = await globalThis.loadCardHelpers();
++        if (generation !== this._generation || !this._visible()) return;
++        card = helpers.createCardElement({ ...this._config });
++      } else if (customElements.get("hui-picture-entity-card")) {
++        card = document.createElement("hui-picture-entity-card");
++        card.setConfig({ ...this._config });
++      } else {
++        throw new Error("Native camera card helpers unavailable");
++      }
++      if (generation !== this._generation || !this._visible()) return;
++      card.hass = this._hass;
++      card.addEventListener("ll-rebuild", (event) => {
++        event.stopPropagation();
++        if (card !== this._card || !this._visible()) return;
++        this._unload();
++        void this._mount();
++      });
++      this._card = card;
++      this._slot.replaceChildren(card);
++    } catch {
++      if (generation === this._generation) this._showStatus("starting", "Waiting for the camera…");
++    } finally {
++      if (generation === this._generation) this._mounting = false;
++    }
++  }
++
++  _observeVideo(video) {
++    if (video === this._video) return;
++    this._cancelFrameCallback();
++    this._video = video;
++    this._lastVideoTime = video?.currentTime;
++    this._lastFrameCount = video?.getVideoPlaybackQuality?.().totalVideoFrames;
++    if (!video || typeof video.requestVideoFrameCallback !== "function") return;
++    const generation = this._generation;
++    const onFrame = () => {
++      if (generation !== this._generation || video !== this._video || !this._visible()) return;
++      this._frameProgress(video);
++      this._frameCallback = video.requestVideoFrameCallback(onFrame);
++    };
++    this._frameCallback = video.requestVideoFrameCallback(onFrame);
++  }
++
++  _frameProgress(video) {
++    if (video.videoWidth <= 2 || video.videoHeight <= 2 || video.readyState < 2) return;
++    const now = performance.now();
++    this._hasValidFrames = true;
++    this._lastProgressAt = now;
++    this._stableSince ??= now;
++    if (now - this._stableSince >= CAMERA_STABLE_MS) this._failures = 0;
++    this._showStatus("playing", "");
++  }
++
++  _check() {
++    if (!this._visible() || !this._available()) {
++      this._reconcile();
++      return;
++    }
++    const now = performance.now();
++    const elements = this._card ? cameraElements(this._card) : [];
++    const videos = elements.filter((element) => element.tagName === "VIDEO" && cameraElementVisible(element));
++    const video = videos.find((element) => element.videoWidth > 2 && element.videoHeight > 2 && element.readyState >= 2 && !element.paused)
++      || (videos.includes(this._video) ? this._video : videos[0]);
++    this._observeVideo(video);
++    if (video) {
++      const frameCount = video.getVideoPlaybackQuality?.().totalVideoFrames;
++      // Chrome can suspend presented-frame signals without marking the page
++      // hidden. Advancing media time also counts as progress so this does not
++      // cause false reconnects. Video frozen under a moving audio clock cannot
++      // be distinguished here; native errors/2x2/publisher loss remain handled.
++      const progressed = (Number.isFinite(frameCount) && frameCount > (this._lastFrameCount ?? frameCount))
++        || video.currentTime > (this._lastVideoTime ?? video.currentTime);
++      if (progressed) this._frameProgress(video);
++      this._lastFrameCount = frameCount;
++      this._lastVideoTime = video.currentTime;
++    }
++    const nativeError = elements.some((element) => element.tagName === "HA-ALERT" && element.getAttribute("alert-type") === "error" && cameraElementVisible(element));
++    const graceOver = now - this._startedAt >= CAMERA_STARTUP_MS;
++    if ((this._hasValidFrames || graceOver) && (nativeError || video?.error)) {
++      this._retry();
++    } else if (this._hasValidFrames && video && video.videoWidth > 0 && video.videoWidth <= 2) {
++      this._retry();
++    } else if (this._hasValidFrames && now - this._lastProgressAt >= CAMERA_STALL_MS && (!video || !video.paused)) {
++      this._retry();
++    } else if (!this._hasValidFrames && graceOver) {
++      this._retry();
++    }
++  }
++
++  _retry() {
++    if (this._retryTimer || !this._visible()) return;
++    const delay = Math.min(1000 * 2 ** Math.min(this._failures++, 5), CAMERA_RETRY_MAX_MS);
++    this._unload();
++    if (this._failures >= CAMERA_FAILED_STARTS_MAX) {
++      this._retryStopped = true;
++      this._showStatus("failed", "Live view could not reconnect");
++      return;
++    }
++    this._showStatus("reconnecting", "Reconnecting…");
++    this._retryTimer = setTimeout(() => {
++      this._retryTimer = undefined;
++      if (!this._visible() || !this._available()) return;
++      this.setAttribute("data-reconnects", String(++this._reconnects));
++      void this._mount();
++    }, delay);
++  }
++
++  _cancelFrameCallback() {
++    if (this._frameCallback !== undefined) this._video?.cancelVideoFrameCallback?.(this._frameCallback);
++    this._frameCallback = undefined;
++  }
++
++  _unload() {
++    ++this._generation;
++    clearInterval(this._watchTimer);
++    this._watchTimer = undefined;
++    this._cancelFrameCallback();
++    this._video = undefined;
++    this._mounting = false;
++    this._card = undefined;
++    this._slot.replaceChildren();
++  }
++
++  _pause() {
++    clearTimeout(this._retryTimer);
++    this._retryTimer = undefined;
++    this._unload();
++  }
++
++  _showStatus(state, message) {
++    if (this.getAttribute("data-state") !== state) this.setAttribute("data-state", state);
++    if (this._status.hidden !== !message) this._status.hidden = !message;
++    if (this._retryButton.hidden !== (state !== "failed")) this._retryButton.hidden = state !== "failed";
++    const name = this._config?.name || this._hass?.states?.[this._config?.entity]?.attributes?.friendly_name;
++    const text = message ? `${name ? `${name}: ` : ""}${message}` : "";
++    if (this._message.textContent !== text) this._message.textContent = text;
++  }
++}
++
++if (!customElements.get("simplisafe-camera-live")) {
++  customElements.define("simplisafe-camera-live", SimpliSafeCameraLive);
++}
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..145972df0d9842165b59e8bc3934412c42040a89
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,9 @@
++[tool.ruff]
++line-length = 100
++extend-exclude = ["custom_components/simplirtc/vendor", "custom_components/simplirtc/protobufs"]
++
++[tool.ruff.lint]
++select = ["E4", "E7", "E9", "F", "I"]
++
++[tool.ruff.format]
++indent-style = "tab"
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a67b64c2693778a23e2255c5b9f456676493746
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,4 @@
++[pytest]
++asyncio_mode = auto
++asyncio_default_fixture_loop_scope = function
++pythonpath = .
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..28da2d3cddf538e9bad34b540a8074387f1794d3
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,60 @@
++"""Real Home Assistant and stock simplipy objects, without user credentials."""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++from homeassistant.core import HomeAssistant
++from homeassistant.helpers import device_registry as dr
++from simplipy.system.v3 import SystemV3
++
++from custom_components.simplirtc import camera
++
++
++@pytest.fixture
++async def camera_factory(tmp_path, monkeypatch):
++	hass = HomeAssistant(str(tmp_path))
++	monkeypatch.setattr(
++		dr, "async_get_device_id_by_identifier", lambda *args, **kwargs: None, raising=False
++	)
++	api = SimpleNamespace(
++		access_token="private-test-token",
++		async_request=AsyncMock(),
++		subscription_data={123: {"location": {"system": {"cameras": [], "serial": "station"}}}},
++	)
++	system = SystemV3(api, 123)
++	system.camera_data = {
++		"hardware-serial": {
++			"uuid": "api-camera-uuid",
++			"model": "SS001",
++			"status": "online",
++			"cameraSettings": {"cameraName": "Private Camera", "admin": {"webRTCProvider": "kvs"}},
++		},
++	}
++	system.generate_device_objects()
++	manager = SimpleNamespace(
++		_api=api,
++		coordinator=SimpleNamespace(hass=hass, config_entry=SimpleNamespace(entry_id="native")),
++		initial_event_to_use={123: {}},
++		systems={123: system},
++	)
++	created = []
++
++	def create(provider="kvs"):
++		system.camera_data["hardware-serial"]["cameraSettings"]["admin"]["webRTCProvider"] = (
++			provider
++		)
++		entity_type = (
++			camera.SimpliSafeLegacyCamera
++			if provider in {None, "simplisafe"}
++			else camera.SimpliSafeCamera
++		)
++		entity = entity_type(manager, system, system.cameras["hardware-serial"])
++		entity.hass = hass
++		entity.entity_id = "camera.test"
++		created.append(entity)
++		return entity
++
++	yield create, manager, system, api
++	for entity in created:
++		await entity.async_will_remove_from_hass()
+diff --git a/tests/test_camera.py b/tests/test_camera.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b63c3e62639424c6a01d00a445f57dc355ba6bd
+--- /dev/null
++++ b/tests/test_camera.py
+@@ -0,0 +1,166 @@
++"""Test actual HA camera interfaces, backend selection, and signaling lifecycle."""
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++import pytest
++from homeassistant.components.camera import StreamType, WebRTCAnswer, WebRTCError
++from homeassistant.exceptions import HomeAssistantError
++
++from custom_components.simplirtc import camera
++from custom_components.simplirtc.backend import CameraBackend, describe_backend
++
++
++@pytest.mark.parametrize(
++	("settings", "backend", "reason"),
++	[
++		({}, CameraBackend.LEGACY, None),
++		({"admin": {}}, CameraBackend.LEGACY, None),
++		({"admin": {"webRTCProvider": "simplisafe"}}, CameraBackend.LEGACY, None),
++		({"admin": {"webRTCProvider": "kvs"}}, CameraBackend.KINESIS, None),
++		({"admin": {"webRTCProvider": "mist"}}, CameraBackend.LIVEKIT, None),
++		({"admin": {"webRTCProvider": "future"}}, CameraBackend.UNKNOWN, "unknown_webrtc_provider"),
++		({"admin": "invalid"}, CameraBackend.UNKNOWN, "unexpected_settings_schema"),
++	],
++)
++def test_provider_selection(settings, backend, reason):
++	result = describe_backend(settings)
++	assert result[1:] == (backend, reason)
++
++
++async def test_real_ha_camera_capabilities(camera_factory):
++	create, _, _, _ = camera_factory
++	legacy = create(None)
++	webrtc = create("kvs")
++	assert legacy.camera_capabilities.frontend_stream_types == {StreamType.HLS}
++	assert webrtc.camera_capabilities.frontend_stream_types == {StreamType.WEB_RTC}
++	assert "private-test-token" not in await legacy.stream_source()
++
++
++async def test_unknown_provider_skipped(camera_factory):
++	_, manager, system, _ = camera_factory
++	system.camera_data["hardware-serial"]["cameraSettings"]["admin"]["webRTCProvider"] = "future"
++	add_entities = Mock()
++	await camera.async_setup_entry(None, SimpleNamespace(runtime_data=manager), add_entities)
++	add_entities.assert_called_once_with([])
++
++
++async def test_live_view_uuid_host_and_wakeup(camera_factory, monkeypatch):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	api.async_request.side_effect = [
++		{"cameraStatus": "sleeping"},
++		{"cameraStatus": "waking"},
++		{"liveKitDetails": {"liveKitURL": "wss://live.example.test", "userToken": "secret"}},
++	]
++	monkeypatch.setattr(camera, "LIVE_VIEW_RETRY_DELAY", 0)
++	result = await entity._create_stream(camera.LiveKitResponse)
++	assert result.liveKitDetails.userToken == "secret"
++	assert api.async_request.await_count == 3
++	assert api.async_request.call_args.args[1] == "cameras/api-camera-uuid/123/live-view"
++	assert api.async_request.call_args.kwargs["headers"] == {
++		"Host": "app-hub.prd.aser.simplisafe.com"
++	}
++
++
++async def test_preparation_timeout_closes_signaling(camera_factory, monkeypatch):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	api.async_request.return_value = {
++		"liveKitDetails": {"liveKitURL": "wss://live.test", "userToken": "secret"}
++	}
++	session = Mock()
++	monkeypatch.setattr(camera, "LiveKitSession", Mock(return_value=session))
++	monkeypatch.setattr(camera, "WEBRTC_PREPARATION_TIMEOUT", 0.01)
++	with pytest.raises(HomeAssistantError, match="Unable to prepare"):
++		await entity.async_prepare_webrtc_client_configuration()
++	session.close.assert_called_once()
++	assert not entity._preparing_sessions
++	assert not entity._preparation_tasks
++	assert not entity._unused_session_expirations
++
++
++async def test_invalid_credentials_response_stays_private(camera_factory, caplog):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	api.async_request.return_value = {"liveKitDetails": {"userToken": "SECRET_RESPONSE_TOKEN"}}
++	with pytest.raises(HomeAssistantError) as failure:
++		await entity.async_prepare_webrtc_client_configuration()
++	assert "SECRET_RESPONSE_TOKEN" not in str(failure.value)
++	assert "SECRET_RESPONSE_TOKEN" not in caplog.text
++
++
++async def test_offer_failure_closes_and_forgets_session(camera_factory):
++	create, _, _, _ = camera_factory
++	entity = create()
++	session = Mock(handle_offer=AsyncMock(side_effect=RuntimeError("private-provider-url")))
++	entity._pool_unused_webrtc_session(session)
++	with pytest.raises(HomeAssistantError, match="Unable to negotiate"):
++		await entity.async_handle_async_webrtc_offer("offer", "client", Mock())
++	session.close.assert_called_once()
++	assert not entity._sessions
++	assert not entity._offer_timers
++
++
++async def test_provider_close_notifies_browser(camera_factory):
++	create, _, _, _ = camera_factory
++	entity = create()
++	session = Mock(handle_offer=AsyncMock())
++	entity._pool_unused_webrtc_session(session)
++	send = Mock()
++	await entity.async_handle_async_webrtc_offer("offer", "client", send)
++	entity._session_closed(session)
++	assert isinstance(send.call_args.args[0], WebRTCError)
++	assert not entity._sessions
++	assert not entity._offer_timers
++
++
++async def test_first_answer_timeout_and_success(camera_factory, monkeypatch):
++	create, _, _, _ = camera_factory
++	entity = create()
++	session = Mock(handle_offer=AsyncMock())
++	entity._pool_unused_webrtc_session(session)
++	send = Mock()
++	await entity.async_handle_async_webrtc_offer("offer", "client", send)
++	forward = session.handle_offer.call_args.args[1]
++	forward(WebRTCAnswer("answer"))
++	assert not entity._offer_timers
++	entity.close_webrtc_session("client")
++	entity._pool_unused_webrtc_session(session)
++	await entity.async_handle_async_webrtc_offer("offer", "client", send)
++	entity._offer_timed_out("client")
++	assert isinstance(send.call_args.args[0], WebRTCError)
++	assert not entity._sessions
++
++
++async def test_unload_cancels_inflight_preparation(camera_factory):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	started = asyncio.Event()
++
++	async def blocked(*args, **kwargs):
++		started.set()
++		await asyncio.Future()
++
++	api.async_request.side_effect = blocked
++	preparation = asyncio.create_task(entity.async_prepare_webrtc_client_configuration())
++	await started.wait()
++	await entity.async_will_remove_from_hass()
++	assert preparation.cancelled()
++	assert not entity._preparation_tasks
++	with pytest.raises(HomeAssistantError, match="unloaded"):
++		await entity.async_prepare_webrtc_client_configuration()
++
++
++async def test_unload_stops_preloaded_legacy_decoder(camera_factory):
++	create, _, _, _ = camera_factory
++	entity = create(None)
++	stream = SimpleNamespace(
++		dynamic_stream_settings=SimpleNamespace(preload_stream=True), stop=AsyncMock()
++	)
++	entity.stream = stream
++	await entity.async_will_remove_from_hass()
++	stream.stop.assert_awaited_once()
++	assert not stream.dynamic_stream_settings.preload_stream
++	assert entity.stream is None
+diff --git a/tests/test_init.py b/tests/test_init.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..58dac902bb0cc1e9e54d02c40ee686ffbfb52925
+--- /dev/null
++++ b/tests/test_init.py
+@@ -0,0 +1,99 @@
++"""Verify child cameras follow native authentication reloads and unload cleanly."""
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++import pytest
++from homeassistant.config_entries import ConfigEntryChange, ConfigEntryState
++from homeassistant.exceptions import ConfigEntryNotReady
++
++from custom_components import simplirtc
++from custom_components.simplirtc.const import ATTR_CONFIG_ENTRY_ID, DOMAIN
++
++
++async def test_native_runtime_reload_rebinds_existing_child(monkeypatch):
++	old_runtime, new_runtime = object(), object()
++	parent = SimpleNamespace(
++		domain="simplisafe",
++		entry_id="native",
++		state=ConfigEntryState.LOADED,
++		runtime_data=new_runtime,
++	)
++	child = SimpleNamespace(
++		data={ATTR_CONFIG_ENTRY_ID: "native"},
++		entry_id="camera",
++		state=ConfigEntryState.LOADED,
++		runtime_data=old_runtime,
++	)
++	entries = SimpleNamespace(
++		async_get_entry=Mock(return_value=parent),
++		async_entries=Mock(return_value=[child]),
++		async_loaded_entries=Mock(return_value=[]),
++		async_reload=AsyncMock(),
++	)
++	tasks = []
++	hass = SimpleNamespace(
++		config_entries=entries,
++		async_create_task=lambda work: tasks.append(asyncio.create_task(work)),
++	)
++	connect = Mock()
++	monkeypatch.setattr(simplirtc, "async_when_setup", Mock())
++	monkeypatch.setattr(simplirtc, "async_dispatcher_connect", connect)
++	discovery = Mock()
++	monkeypatch.setattr(simplirtc.discovery_flow, "async_create_flow", discovery)
++	await simplirtc.async_setup(hass, {DOMAIN: {}})
++	listener = connect.call_args.args[2]
++	listener(ConfigEntryChange.UPDATED, parent)
++	await asyncio.gather(*tasks)
++	entries.async_reload.assert_awaited_once_with("camera")
++	discovery.assert_not_called()
++	child.runtime_data = new_runtime
++	listener(ConfigEntryChange.UPDATED, parent)
++	await asyncio.gather(*tasks)
++	assert entries.async_reload.await_count == 1
++
++
++async def test_native_unload_only_unloads_camera_child(monkeypatch):
++	parent = SimpleNamespace(
++		domain="simplisafe", entry_id="native", state=ConfigEntryState.NOT_LOADED
++	)
++	child = SimpleNamespace(
++		data={ATTR_CONFIG_ENTRY_ID: "native"}, entry_id="camera", state=ConfigEntryState.LOADED
++	)
++	entries = SimpleNamespace(
++		async_get_entry=Mock(return_value=parent),
++		async_entries=Mock(return_value=[child]),
++		async_loaded_entries=Mock(return_value=[]),
++		async_unload=AsyncMock(),
++	)
++	tasks = []
++	hass = SimpleNamespace(
++		config_entries=entries,
++		async_create_task=lambda work: tasks.append(asyncio.create_task(work)),
++	)
++	connect = Mock()
++	monkeypatch.setattr(simplirtc, "async_when_setup", Mock())
++	monkeypatch.setattr(simplirtc, "async_dispatcher_connect", connect)
++	await simplirtc.async_setup(hass, {DOMAIN: {}})
++	connect.call_args.args[2](ConfigEntryChange.UPDATED, parent)
++	await asyncio.gather(*tasks)
++	entries.async_unload.assert_awaited_once_with("camera")
++
++
++async def test_entry_waits_for_native_authentication():
++	parent = SimpleNamespace(state=ConfigEntryState.SETUP_RETRY)
++	hass = SimpleNamespace(
++		config_entries=SimpleNamespace(async_get_entry=Mock(return_value=parent))
++	)
++	entry = SimpleNamespace(data={ATTR_CONFIG_ENTRY_ID: "native"})
++	with pytest.raises(ConfigEntryNotReady, match="native SimpliSafe integration"):
++		await simplirtc.async_setup_entry(hass, entry)
++
++
++async def test_platform_unload_keeps_native_integration_running():
++	unload = AsyncMock(return_value=True)
++	hass = SimpleNamespace(config_entries=SimpleNamespace(async_unload_platforms=unload))
++	entry = object()
++	assert await simplirtc.async_unload_entry(hass, entry)
++	unload.assert_awaited_once_with(entry, simplirtc.PLATFORMS)
+diff --git a/tests/test_legacy.py b/tests/test_legacy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ddc67e1bd923dfd9fa5c3a6e1a5d01e411966c6
+--- /dev/null
++++ b/tests/test_legacy.py
+@@ -0,0 +1,172 @@
++"""Exercise the real loopback relay with controlled HTTP FLV sources."""
++
++import asyncio
++from contextlib import asynccontextmanager
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++from urllib.parse import urlsplit
++
++import pytest
++from aiohttp import ClientSession, web
++
++from custom_components.simplirtc.legacy import LegacyStreamRelay
++
++
++@asynccontextmanager
++async def serve(handler):
++	app = web.Application()
++	app.router.add_get("/camera", handler)
++	runner = web.AppRunner(app, access_log=None)
++	await runner.setup()
++	await web.TCPSite(runner, "127.0.0.1", 0).start()
++	try:
++		yield f"http://127.0.0.1:{runner.addresses[0][1]}/camera"
++	finally:
++		await runner.cleanup()
++
++
++async def test_relay_auth_is_private_and_body_streams():
++	auth_headers = []
++
++	async def upstream(request):
++		auth_headers.append(request.headers.get("Authorization"))
++		assert not request.query
++		return web.Response(body=b"FLV\x01controlled-video-payload", content_type="video/x-flv")
++
++	async with serve(upstream) as url, ClientSession() as session:
++		api = SimpleNamespace(
++			session=session, access_token="SECRET_OAUTH", async_request=AsyncMock()
++		)
++		relay = LegacyStreamRelay(api, "camera-uuid")
++		relay._upstream = url
++		source = await relay.source()
++		assert source == await relay.source()
++		assert urlsplit(source).hostname == "127.0.0.1"
++		assert "SECRET_OAUTH" not in source
++		async with session.get(source) as response:
++			assert response.status == 200
++			assert await response.read() == b"FLV\x01controlled-video-payload"
++		async with session.get(source.replace("token=", "token=wrong")) as response:
++			assert response.status == 403
++		assert auth_headers == ["Bearer SECRET_OAUTH"]
++		api.async_request.assert_awaited_once_with("get", "api/authCheck")
++		await relay.close()
++		with pytest.raises(RuntimeError, match="unloaded"):
++			await relay.source()
++
++
++async def test_401_refresh_uses_current_access_token():
++	headers = []
++
++	async def upstream(request):
++		headers.append(request.headers["Authorization"])
++		return web.Response(status=401) if len(headers) == 1 else web.Response(body=b"FLV")
++
++	async with serve(upstream) as url, ClientSession() as session:
++		api = SimpleNamespace(session=session, access_token="expired", async_request=AsyncMock())
++
++		async def refresh():
++			api.access_token = "fresh"
++
++		api.async_refresh_access_token = AsyncMock(side_effect=refresh)
++		relay = LegacyStreamRelay(api, "camera-uuid")
++		relay._upstream = url
++		async with session.get(await relay.source()) as response:
++			assert response.status == 200
++			assert await response.read() == b"FLV"
++		assert headers == ["Bearer expired", "Bearer fresh"]
++		api.async_refresh_access_token.assert_awaited_once()
++		await relay.close()
++
++
++async def test_close_cancels_open_stream_and_does_not_close_shared_session():
++	upstream_closed = asyncio.Event()
++
++	async def upstream(request):
++		response = web.StreamResponse()
++		await response.prepare(request)
++		await response.write(b"FLV")
++		try:
++			for _ in range(100):
++				await asyncio.sleep(0.01)
++				await response.write(b"data")
++		except ConnectionError:
++			upstream_closed.set()
++		return response
++
++	async with serve(upstream) as url, ClientSession() as session:
++		api = SimpleNamespace(session=session, access_token="token", async_request=AsyncMock())
++		relay = LegacyStreamRelay(api, "camera-uuid")
++		relay._upstream = url
++		async with session.get(await relay.source()) as response:
++			assert await response.content.readexactly(3) == b"FLV"
++			await relay.close()
++		assert not session.closed
++		assert not relay._requests
++		await asyncio.wait_for(upstream_closed.wait(), 2)
++
++
++@pytest.mark.parametrize("status", [302, 403, 500])
++async def test_upstream_errors_are_not_relayed_as_camera_bytes(status):
++	async def upstream(request):
++		return web.Response(status=status, headers={"Location": "https://untrusted.example.test"})
++
++	async with serve(upstream) as url, ClientSession() as session:
++		api = SimpleNamespace(session=session, access_token="token", async_request=AsyncMock())
++		relay = LegacyStreamRelay(api, "camera-uuid")
++		relay._upstream = url
++		async with session.get(await relay.source()) as response:
++			assert response.status == 502
++		await relay.close()
++
++
++async def test_real_ha_decoder_reads_authenticated_h264_flv_from_relay():
++	"""Encode video, relay its authenticated HTTP source, and decode with HA's worker."""
++	from fractions import Fraction
++	from io import BytesIO
++	from itertools import islice
++
++	import av
++	import numpy as np
++	from homeassistant.components.stream.worker import try_open_stream
++
++	encoded = BytesIO()
++	with av.open(encoded, mode="w", format="flv") as output:
++		video = output.add_stream("libx264", rate=10, options={"tune": "zerolatency", "bf": "0"})
++		video.width = 64
++		video.height = 48
++		video.pix_fmt = "yuv420p"
++		for index in range(3):
++			frame = av.VideoFrame.from_ndarray(
++				np.full((48, 64, 3), index * 80, dtype=np.uint8), format="rgb24"
++			)
++			frame.pts = index
++			frame.time_base = Fraction(1, 10)
++			for packet in video.encode(frame):
++				output.mux(packet)
++		for packet in video.encode():
++			output.mux(packet)
++	payload = encoded.getvalue()
++	auth_headers = []
++
++	async def upstream(request):
++		auth_headers.append(request.headers.get("Authorization"))
++		return web.Response(body=payload, content_type="video/x-flv")
++
++	def decode(source):
++		with try_open_stream(source, {}) as container:
++			return [(frame.width, frame.height) for frame in islice(container.decode(video=0), 3)]
++
++	async with serve(upstream) as url, ClientSession() as session:
++		api = SimpleNamespace(
++			session=session, access_token="PRIVATE_VIDEO_TOKEN", async_request=AsyncMock()
++		)
++		relay = LegacyStreamRelay(api, "camera-uuid")
++		relay._upstream = url
++		try:
++			frames = await asyncio.wait_for(asyncio.to_thread(decode, await relay.source()), 10)
++			assert frames == [(64, 48)] * 3
++			assert auth_headers == ["Bearer PRIVATE_VIDEO_TOKEN"]
++			api.async_request.assert_awaited_once_with("get", "api/authCheck")
++		finally:
++			await relay.close()
+diff --git a/tests/test_livekit_diagnostics.py b/tests/test_livekit_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bdc343e23eba3aac0b56df13f34df410211d3b6
+--- /dev/null
++++ b/tests/test_livekit_diagnostics.py
+@@ -0,0 +1,210 @@
++"""LiveKit diagnostics explain media state changes without exposing room secrets."""
++
++import base64
++import json
++import logging
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from custom_components.simplirtc import camera, livekit
++from custom_components.simplirtc.protobufs.livekit_models_pb2 import (
++	AUDIO,
++	CAMERA,
++	MICROPHONE,
++	PARTICIPANT_REMOVED,
++	VIDEO,
++	ParticipantInfo,
++	Room,
++	TrackInfo,
++)
++from custom_components.simplirtc.protobufs.livekit_rtc_pb2 import (
++	JoinResponse,
++	LeaveRequest,
++	ParticipantUpdate,
++	Pong,
++	RoomMovedResponse,
++	SessionDescription,
++	SignalResponse,
++	SubscriptionPermissionUpdate,
++	SubscriptionResponse,
++)
++
++
++def jwt(room="PRIVATE_ROOM", subject="PRIVATE_SUBJECT", issued=1000, expires=1300):
++	payload = (
++		base64.urlsafe_b64encode(
++			json.dumps(
++				{"exp": expires, "iat": issued, "sub": subject, "video": {"room": room}}
++			).encode()
++		)
++		.decode()
++		.rstrip("=")
++	)
++	return f"header.{payload}.PRIVATE_SIGNATURE"
++
++
++@pytest.mark.parametrize("token", ["not-a-jwt", "a.not!base64.c", "a.W10.c", "x" * 16385])
++def test_invalid_claims_are_optional_diagnostics(token):
++	assert livekit.read_credential_metadata(token) == livekit.LiveKitCredentialMetadata()
++
++
++def test_claims_are_unverified_and_identifiers_are_not_in_repr():
++	metadata = livekit.read_credential_metadata(jwt())
++	assert metadata.expires_at == 1300
++	assert metadata.issued_at == 1000
++	assert metadata.room == "PRIVATE_ROOM"
++	assert metadata.subject == "PRIVATE_SUBJECT"
++	assert "PRIVATE" not in repr(metadata)
++	assert livekit.read_credential_metadata(jwt(expires=True)).expires_at is None
++
++
++async def test_live_view_claim_continuity_and_bounded_health_logs(
++	camera_factory, monkeypatch, caplog
++):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	clock = [0]
++	monkeypatch.setattr(
++		camera, "time", SimpleNamespace(time=lambda: 1000, monotonic=lambda: clock[0])
++	)
++	caplog.set_level(logging.INFO)
++	response = {"cameraStatus": "online", "liveKitDetails": {"userToken": jwt()}}
++	api.async_request.return_value = response
++	await entity._request_live_view()
++	assert "claimed_credential_lifetime_s=300" in caplog.text
++	assert "claimed_credential_expires_in_s=300" in caplog.text
++	await entity._request_live_view()
++	assert "same_room=True same_subject=True" in caplog.text
++	count = len(caplog.records)
++	for _ in range(5):
++		await entity._request_live_view()
++	assert len(caplog.records) == count
++	clock[0] = 61
++	await entity._request_live_view()
++	assert len(caplog.records) == count + 1
++	assert "request_count=8" in caplog.text
++	api.async_request.return_value = {
++		"cameraStatus": "online",
++		"liveKitDetails": {"userToken": jwt("PRIVATE_NEW_ROOM", "PRIVATE_NEW_SUBJECT")},
++	}
++	await entity._request_live_view()
++	assert "same_room=False same_subject=False" in caplog.text
++	api.async_request.return_value = {"cameraStatus": {"unexpected": "PRIVATE_STATUS"}}
++	await entity._request_live_view()
++	assert "status=unknown" in caplog.text
++	assert "PRIVATE" not in caplog.text
++	assert jwt() not in caplog.text
++
++
++def signal(monkeypatch):
++	result = livekit.LiveKitSignal(
++		ws=SimpleNamespace(closed=False),
++		logger=logging.getLogger("test.simplirtc.livekit"),
++		task_group=Mock(),
++		credential_metadata=livekit.read_credential_metadata(jwt()),
++	)
++	monkeypatch.setattr(result, "_start_ping", Mock())
++	return result
++
++
++def test_publisher_departure_records_video_loss_without_identifiers(monkeypatch, caplog):
++	connection = signal(monkeypatch)
++	caplog.set_level(logging.INFO)
++	publisher = ParticipantInfo(
++		sid="PRIVATE_PARTICIPANT_UUID",
++		identity="PRIVATE_CAMERA_UUID",
++		name="PRIVATE_CAMERA_NAME",
++		metadata="PRIVATE_METADATA",
++		state=ParticipantInfo.ACTIVE,
++		is_publisher=True,
++		tracks=[
++			TrackInfo(sid="PRIVATE_VIDEO_TRACK", type=VIDEO, source=CAMERA),
++			TrackInfo(sid="PRIVATE_AUDIO_TRACK", type=AUDIO, source=MICROPHONE),
++		],
++	)
++	join = SignalResponse(
++		join=JoinResponse(
++			room=Room(name="PRIVATE_ROOM"),
++			participant=ParticipantInfo(identity="PRIVATE_SUBJECT"),
++			other_participants=[publisher],
++			ping_interval=20,
++			ping_timeout=60,
++		)
++	)
++	assert connection._response_message(join)[0] == "join"
++	assert "claimed_room_matches=True claimed_subject_matches=True" in caplog.text
++	assert "active_camera_video=1" in caplog.text
++	connection._response_message(
++		SignalResponse(
++			update=ParticipantUpdate(
++				participants=[
++					ParticipantInfo(
++						sid=publisher.sid,
++						state=ParticipantInfo.DISCONNECTED,
++						disconnect_reason=PARTICIPANT_REMOVED,
++					)
++				]
++			)
++		)
++	)
++	assert "camera video tracks removed" in caplog.text
++	assert "removed=1 remaining=0" in caplog.text
++	assert "disconnect_reason_counts=[(4, 1)]" in caplog.text
++	assert "PRIVATE" not in caplog.text
++
++
++def test_continuity_events_and_subscription_failure_stay_private(monkeypatch, caplog):
++	connection = signal(monkeypatch)
++	caplog.set_level(logging.INFO)
++	events = [
++		SignalResponse(
++			subscription_permission_update=SubscriptionPermissionUpdate(
++				participant_sid="PRIVATE_PARTICIPANT", track_sid="PRIVATE_TRACK", allowed=False
++			)
++		),
++		SignalResponse(
++			subscription_response=SubscriptionResponse(track_sid="PRIVATE_TRACK", err=1)
++		),
++		SignalResponse(refresh_token=jwt(expires=1600)),
++		SignalResponse(
++			room_moved=RoomMovedResponse(
++				token=jwt("PRIVATE_OTHER_ROOM", "PRIVATE_OTHER_SUBJECT"),
++				room=Room(name="PRIVATE_OTHER_ROOM"),
++			)
++		),
++		SignalResponse(
++			leave=LeaveRequest(action=LeaveRequest.RECONNECT, reason=14, can_reconnect=True)
++		),
++		SignalResponse(
++			offer=SessionDescription(
++				type="offer", sdp="m=audio 9\r\nm=video 9\r\na=PRIVATE_SDP\r\n"
++			)
++		),
++	]
++	for event in events:
++		connection._response_message(event)
++	assert "allowed=False" in caplog.text
++	assert "error_code=1" in caplog.text
++	assert "kind=refresh_token same_room=True same_subject=True" in caplog.text
++	assert "kind=room_moved same_room=False same_subject=False" in caplog.text
++	assert "action_code=2 reason_code=14 can_reconnect=True" in caplog.text
++	assert "kind=offer audio_sections=1 video_sections=1" in caplog.text
++	assert "PRIVATE" not in caplog.text
++	assert jwt(expires=1600) not in caplog.text
++
++
++def test_signaling_health_log_is_bounded(monkeypatch, caplog):
++	connection = signal(monkeypatch)
++	clock = [0]
++	monkeypatch.setattr(livekit, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++	connection._started_at = 0
++	caplog.set_level(logging.INFO)
++	for _ in range(10):
++		connection._response_message(SignalResponse(pong_resp=Pong()))
++	assert len(caplog.records) == 1
++	clock[0] = 61
++	connection._response_message(SignalResponse(pong_resp=Pong()))
++	assert len(caplog.records) == 2
++	assert "elapsed_s=61 pings_sent=0 pongs_received=11" in caplog.text
+diff --git a/tests/test_livekit_recovery.py b/tests/test_livekit_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c71bc1b2d8f2fb1dbf3cfab7cd7c56d4f677626
+--- /dev/null
++++ b/tests/test_livekit_recovery.py
+@@ -0,0 +1,182 @@
++"""Publisher loss must release native HA sessions so dashboard recovery can reopen."""
++
++import asyncio
++import logging
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++from homeassistant.components.camera import WebRTCError
++
++from custom_components.simplirtc.livekit import LiveKitSession, LiveKitSignal, WarmupSession
++from custom_components.simplirtc.protobufs.livekit_models_pb2 import (
++	AUDIO,
++	CAMERA,
++	CLIENT_INITIATED,
++	MICROPHONE,
++	VIDEO,
++	ParticipantInfo,
++	TrackInfo,
++)
++from custom_components.simplirtc.protobufs.livekit_rtc_pb2 import (
++	JoinResponse,
++	ParticipantUpdate,
++	SignalResponse,
++	SubscriptionPermissionUpdate,
++)
++
++
++def publisher(sid="camera", video="camera-video"):
++	return ParticipantInfo(
++		sid=sid,
++		state=ParticipantInfo.ACTIVE,
++		is_publisher=True,
++		tracks=[
++			TrackInfo(sid=f"{sid}-audio", type=AUDIO, source=MICROPHONE),
++			TrackInfo(sid=video, type=VIDEO, source=CAMERA),
++		],
++	)
++
++
++def departure(sid="camera"):
++	return SignalResponse(
++		update=ParticipantUpdate(
++			participants=[
++				ParticipantInfo(
++					sid=sid,
++					state=ParticipantInfo.DISCONNECTED,
++					disconnect_reason=CLIENT_INITIATED,
++				)
++			]
++		)
++	)
++
++
++class SignalFixture(LiveKitSignal):
++	def __init__(self, responses):
++		super().__init__(
++			ws=SimpleNamespace(closed=False), logger=logging.getLogger(__name__), task_group=Mock()
++		)
++		self.responses = responses
++		self.parsed = []
++		self.send = AsyncMock()
++		self._start_ping = Mock()
++
++	async def messages(self):
++		for response in self.responses:
++			self.parsed.append(response)
++			yield self._response_message(response)
++
++
++async def test_camera_departure_sends_one_native_error_and_forgets_session(camera_factory):
++	create, _, _, api = camera_factory
++	entity = create("mist")
++	connection = SignalFixture(
++		[
++			SignalResponse(join=JoinResponse(other_participants=[publisher()], ping_interval=5)),
++			departure(),
++			SignalResponse(update=ParticipantUpdate(participants=[publisher("replacement")])),
++		]
++	)
++	session = LiveKitSession(
++		livekit_url="wss://private.example.test",
++		user_token="private-token",
++		send_ice_servers=Mock(),
++	)
++
++	async def read():
++		await session._run_browser_signal(connection)
++
++	session._read = AsyncMock(side_effect=read)
++	session.start(lambda: entity._session_closed(session))
++	reader = session._reader_task
++	entity._pool_unused_webrtc_session(session)
++	received = []
++	error_ready = asyncio.Event()
++
++	def send(message):
++		received.append(message)
++		if isinstance(message, WebRTCError):
++			error_ready.set()
++
++	await entity.async_handle_async_webrtc_offer("native-offer", "browser", send)
++	await asyncio.wait_for(error_ready.wait(), 0.5)
++	assert reader is not None
++	await asyncio.gather(reader, return_exceptions=True)
++	assert session.camera_video_ended
++	assert [message.code for message in received if isinstance(message, WebRTCError)] == [
++		"stream_closed"
++	]
++	assert "ended the live view" in received[-1].message
++	assert not entity._sessions
++	assert not entity._session_senders
++	assert not entity._offer_timers
++	assert not entity._unused_session_expirations
++	assert len(connection.parsed) == 2
++	entity._session_closed(session)
++	assert len(received) == 1
++	api.async_request.assert_not_awaited()
++
++
++async def test_other_participant_departure_keeps_camera_video():
++	connection = SignalFixture(
++		[
++			SignalResponse(join=JoinResponse(other_participants=[publisher()], ping_interval=5)),
++			departure("other-viewer"),
++		]
++	)
++	session = LiveKitSession(livekit_url="wss://test", user_token="token", send_ice_servers=Mock())
++	on_close = Mock()
++	session._on_close = on_close
++	await session._run_browser_signal(connection)
++	assert not session.camera_video_ended
++	assert not connection.camera_video_ended
++	on_close.assert_not_called()
++
++
++async def test_removing_one_of_two_camera_publishers_keeps_browser_session():
++	connection = SignalFixture(
++		[
++			SignalResponse(
++				join=JoinResponse(
++					other_participants=[publisher(), publisher("other-camera", "other-video")],
++					ping_interval=5,
++				)
++			),
++			departure(),
++		]
++	)
++	session = LiveKitSession(livekit_url="wss://test", user_token="token", send_ice_servers=Mock())
++	on_close = Mock()
++	session._on_close = on_close
++	await session._run_browser_signal(connection)
++	assert not session.camera_video_ended
++	on_close.assert_not_called()
++
++
++async def test_initial_warmup_accepts_replacement_publisher_after_temporary_loss():
++	connection = SignalFixture(
++		[
++			SignalResponse(update=ParticipantUpdate(participants=[publisher()])),
++			departure(),
++			SignalResponse(
++				update=ParticipantUpdate(
++					participants=[publisher("replacement", "replacement-video")]
++				)
++			),
++			SignalResponse(
++				subscription_permission_update=SubscriptionPermissionUpdate(
++					track_sid="replacement-audio", allowed=True
++				)
++			),
++			SignalResponse(
++				subscription_permission_update=SubscriptionPermissionUpdate(
++					track_sid="replacement-video", allowed=True
++				)
++			),
++		]
++	)
++	warmup = WarmupSession(connection, ice_servers=[])
++	await warmup.run()
++	assert not warmup._waiting_for_track_permissions
++	assert not connection.camera_video_ended
++	assert len(connection.parsed) == 5
+diff --git a/tests/test_manifest.py b/tests/test_manifest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4cf905771135476ee38aef91a82b5cadbcf5e68
+--- /dev/null
++++ b/tests/test_manifest.py
+@@ -0,0 +1,17 @@
++"""Verify explicit integration requirements against the tested runtime."""
++
++import json
++from importlib.metadata import version
++from pathlib import Path
++
++from packaging.requirements import Requirement
++
++
++def test_manifest_declares_response_and_protobuf_runtimes():
++	manifest = json.loads(
++		(Path(__file__).parents[1] / "custom_components/simplirtc/manifest.json").read_text()
++	)
++	requirements = {item.name.lower(): item for item in map(Requirement, manifest["requirements"])}
++	assert {"pydantic", "protobuf"} <= requirements.keys()
++	for requirement in requirements.values():
++		assert version(requirement.name) in requirement.specifier
+diff --git a/tests/test_security.py b/tests/test_security.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd402e73020e9a0a104c96e89e8c85548f3cb18b
+--- /dev/null
++++ b/tests/test_security.py
+@@ -0,0 +1,44 @@
++"""Diagnostics and stock-library debug logs must not expose cloud credentials."""
++
++import logging
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++from custom_components.simplirtc import diagnostics
++from custom_components.simplirtc.security import LiveViewLogFilter, redact_live_view_logging
++
++
++async def test_diagnostics_allowlist_never_serializes_entry_tokens(camera_factory):
++	_, manager, _, _ = camera_factory
++	entry = SimpleNamespace(
++		runtime_data=manager,
++		domain="simplirtc",
++		version=1,
++		minor_version=1,
++		data={"token": "SECRET_TOKEN", "config_entry_id": "PRIVATE_NATIVE_ID"},
++		options={"alarm_code": "PRIVATE_PIN"},
++		as_dict=Mock(side_effect=AssertionError("Entry secrets must not be serialized")),
++	)
++	result = await diagnostics.async_get_config_entry_diagnostics(None, entry)
++	serialized = str(result)
++	assert "SECRET_TOKEN" not in serialized
++	assert "PRIVATE_PIN" not in serialized
++	assert "PRIVATE_NATIVE_ID" not in serialized
++	assert "Private Camera" not in serialized
++	assert result["systems"][0]["cameras"][0]["backend"] == "kinesis"
++
++
++def test_stock_library_live_view_log_is_redacted(caplog):
++	redact_live_view_logging()
++	redact_live_view_logging()
++	logger = logging.getLogger("simplipy")
++	assert len([item for item in logger.filters if isinstance(item, LiveViewLogFilter)]) == 1
++	with caplog.at_level(logging.DEBUG, logger="simplipy"):
++		logger.debug(
++			"Data received from /%s: %s",
++			"cameras/example/123/live-view",
++			{"userToken": "PRIVATE_LIVE_TOKEN"},
++		)
++		logger.debug("Data received from /%s: %s", "api/authCheck", {"userId": "unchanged"})
++	assert "PRIVATE_LIVE_TOKEN" not in caplog.text
++	assert "unchanged" in caplog.text
+diff --git a/tests/test_transports.py b/tests/test_transports.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..792b3781e151aded581c33bae021aca852b3d53b
+--- /dev/null
++++ b/tests/test_transports.py
+@@ -0,0 +1,33 @@
++"""Check the vendored warmup transport against Home Assistant's PyAV versions."""
++
++from fractions import Fraction
++from unittest.mock import AsyncMock
++
++import av
++import numpy as np
++
++from custom_components.simplirtc.livekit import WarmupSession
++from custom_components.simplirtc.vendor.aiortc.codecs.h264 import H264Encoder
++
++
++async def test_real_warmup_sdp_can_be_created_and_closed():
++	signal = AsyncMock()
++	warmup = WarmupSession(signal, ice_servers=[])
++	try:
++		await warmup._send_peer_offer()
++		request = signal.send.call_args.args[0]
++		assert request.offer.type == "offer"
++		assert "m=audio " in request.offer.sdp
++		assert "m=video " in request.offer.sdp
++		assert request.offer.sdp.count("a=recvonly") == 2
++	finally:
++		await warmup._peer_connection.close()
++
++
++def test_vendored_h264_encoder_accepts_installed_pyav():
++	frame = av.VideoFrame.from_ndarray(np.zeros((32, 32, 3), dtype=np.uint8), format="rgb24")
++	frame.pts = 0
++	frame.time_base = Fraction(1, 30)
++	packets, timestamp = H264Encoder().encode(frame, force_keyframe=True)
++	assert packets
++	assert timestamp == 0

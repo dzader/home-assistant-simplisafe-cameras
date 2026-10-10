@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "repositories": {
+    "hass-simplirtc": {
+      "baseline_commit": "d6c2ecb12ec3c8a7b44a2d6ea98b85971c56bf39",
+      "source_patch_sha256": "33ddda1026ae8e4118302f0050fe260a2f13a625abad2a7fd3a0eb018f3c99bb",
+      "untracked_source_additions": [
+        "custom_components/simplirtc/backend.py",
+        "custom_components/simplirtc/legacy.py",
+        "custom_components/simplirtc/security.py",
+        "frontend/simplisafe-camera-live.js",
+        "pyproject.toml",
+        "pytest.ini",
+        "tests/conftest.py",
+        "tests/test_camera.py",
+        "tests/test_init.py",
+        "tests/test_legacy.py",
+        "tests/test_livekit_diagnostics.py",
+        "tests/test_livekit_recovery.py",
+        "tests/test_manifest.py",
+        "tests/test_security.py",
+        "tests/test_transports.py"
+      ],
+      "url": "https://github.com/gilliginsisland/hass-simplirtc"
+    },
+    "home-assistant-core": {
+      "baseline_commit": "2427629e2e6b50890a4abbce39f193bfdc7257e4",
+      "url": "https://github.com/home-assistant/core"
+    },
+    "references/homebridge-simplisafe3": {
+      "baseline_commit": "aec7b6939c45fe2d69223d0e173599a75048226a",
+      "url": "https://github.com/homebridge-simplisafe3/homebridge-simplisafe3"
+    },
+    "references/simplisafe-livekit-homekit": {
+      "baseline_commit": "ebb527bb2e596562fecbc80a4d44ee2f7e7ea795",
+      "url": "https://github.com/BookOnTape/simplisafe-livekit-homekit"
+    },
+    "simplisafe-python": {
+      "baseline_commit": "b03f554cdb2c5981841a8aaa3ee7bb17ef6e79ee",
+      "source_patch_sha256": "3e8bc6018e845ba0cddd3b5e863b1c05d21416550a97982051356f0c73de6f6f",
+      "untracked_source_additions": [
+        "simplipy/device/live_view.py",
+        "tests/fixtures/kvs_live_view_response.json",
+        "tests/fixtures/mist_live_view_response.json",
+        "tests/test_camera_live_view.py"
+      ],
+      "url": "https://github.com/bachya/simplisafe-python"
+    }
+  },
+  "livekit_protocol": {
+    "url": "https://github.com/livekit/protocol",
+    "baseline_commit": "ad2cb9af4442a0ee04bb0815ba4b8ee4e2f6ba6f"
+  },
+  "aiortc": {
+    "url": "https://github.com/aiortc/aiortc",
+    "version": "1.14.0"
+  }
+}

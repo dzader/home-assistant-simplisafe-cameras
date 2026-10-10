@@ -1,25 +1,28 @@
 {
   "domain": "simplirtc",
-  "name": "Simplisafe WebRTC Cameras",
+  "name": "SimpliSafe Camera Streaming",
   "dependencies": [
-    "simplisafe"
+    "simplisafe",
+    "stream"
   ],
   "requirements": [
     "aioice>=0.10.1,<1.0.0",
-    "av>=14.0.0,<18.0.0",
+    "av>=14.0.0,<20.0.0",
     "cryptography>=44.0.0",
     "google-crc32c>=1.1",
-    "pyee>=13.0.0",
+    "pyee>=13.0.0,<15.0.0",
     "pylibsrtp>=0.10.0",
-    "pyopenssl>=25.0.0"
+    "pyopenssl>=25.0.0",
+    "pydantic>=2.8.0,<3.0.0",
+    "protobuf>=6.32.0,<8.0.0"
   ],
   "codeowners": [
-    "gilliginsisland"
+    "dzader"
   ],
   "config_flow": false,
   "single_config_entry": true,
   "iot_class": "cloud_polling",
-  "documentation": "https://github.com/gilliginsisland/hass-simplirtc",
-  "issue_tracker": "https://github.com/gilliginsisland/hass-simplirtc/issues",
-  "version": "1.0"
+  "documentation": "https://github.com/dzader/home-assistant-simplisafe-cameras",
+  "issue_tracker": "https://github.com/dzader/home-assistant-simplisafe-cameras/issues",
+  "version": "1.1.3"
 }

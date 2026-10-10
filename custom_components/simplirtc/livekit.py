@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
+import json
+import logging
+import time
+from collections import Counter
 from collections.abc import (
 	AsyncGenerator,
 	AsyncIterator,
@@ -11,11 +16,8 @@ from collections.abc import (
 	Iterable,
 )
 from contextlib import asynccontextmanager
-import gzip
-import json
-import logging
+from dataclasses import dataclass, field
 from secrets import token_hex
-import time
 from typing import Literal, TypeAlias, override
 from urllib.parse import urlencode
 
@@ -31,20 +33,13 @@ from homeassistant.components.camera import (
 )
 from webrtc_models import RTCIceCandidateInit
 
-from .vendor.aiortc import (
-	RTCBundlePolicy,
-	RTCConfiguration,
-	RTCIceServer,
-	RTCPeerConnection,
-	RTCSessionDescription,
-)
-from .vendor.aiortc.sdp import candidate_from_sdp
 from .protobufs.livekit_models_pb2 import (
 	AUDIO,
 	CAMERA,
-	ClientInfo,
 	MICROPHONE,
 	VIDEO,
+	ClientInfo,
+	ParticipantInfo,
 )
 from .protobufs.livekit_rtc_pb2 import (
 	ConnectionSettings,
@@ -65,6 +60,14 @@ from .protobufs.livekit_rtc_pb2 import (
 	TrickleRequest,
 	WrappedJoinRequest,
 )
+from .vendor.aiortc import (
+	RTCBundlePolicy,
+	RTCConfiguration,
+	RTCIceServer,
+	RTCPeerConnection,
+	RTCSessionDescription,
+)
+from .vendor.aiortc.sdp import candidate_from_sdp
 from .webrtc import MessageQueue, SimpliSafeWebRTCSession
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,6 +78,38 @@ _CAMERA_TRACK_KIND_BY_TYPE_SOURCE = {
 	(AUDIO, MICROPHONE): "audio",
 	(VIDEO, CAMERA): "video",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class LiveKitCredentialMetadata:
+	"""Unverified JWT claims used only for safe connection diagnostics."""
+
+	expires_at: int | None = None
+	issued_at: int | None = None
+	room: str | None = field(default=None, repr=False)
+	subject: str | None = field(default=None, repr=False)
+
+
+def read_credential_metadata(token: str) -> LiveKitCredentialMetadata:
+	"""Read an allowlist of local claims without logging or validating credentials."""
+	try:
+		if len(token) > 16384:
+			return LiveKitCredentialMetadata()
+		payload = token.split(".")[1]
+		claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+		if not isinstance(claims, dict):
+			return LiveKitCredentialMetadata()
+		video = claims.get("video")
+		room = video.get("room") if isinstance(video, dict) else None
+		return LiveKitCredentialMetadata(
+			expires_at=claims.get("exp") if type(claims.get("exp")) is int else None,
+			issued_at=claims.get("iat") if type(claims.get("iat")) is int else None,
+			room=room if isinstance(room, str) else None,
+			subject=claims.get("sub") if isinstance(claims.get("sub"), str) else None,
+		)
+	except (ValueError, IndexError, UnicodeDecodeError, RecursionError):
+		return LiveKitCredentialMetadata()
+
 
 SessionClosedCallback = Callable[[], None]
 SendIceServers = Callable[[list[ICEServer]], None]
@@ -102,11 +137,27 @@ class LiveKitSignal:
 		ws: ClientWebSocketResponse,
 		logger: logging.Logger,
 		task_group: asyncio.TaskGroup,
+		credential_metadata: LiveKitCredentialMetadata | None = None,
 	) -> None:
 		self._ws = ws
 		self._logger = logger
 		self._task_group = task_group
 		self._ping_task: asyncio.Task[None] | None = None
+		self._credential_metadata = credential_metadata or LiveKitCredentialMetadata()
+		self._started_at = time.monotonic()
+		self._camera_video_tracks: dict[str, set[str]] = {}
+		self._camera_video_seen = False
+		self._participant_summary: tuple | None = None
+		self._pings_sent = 0
+		self._pongs_received = 0
+		self._last_pong_log_at: float | None = None
+		self._message_counts: Counter[str | None] = Counter()
+		self._kind_log_at: dict[str | None, float] = {}
+
+	@property
+	def camera_video_ended(self) -> bool:
+		"""Return whether previously published camera video is now absent."""
+		return self._camera_video_seen and not any(self._camera_video_tracks.values())
 
 	@classmethod
 	@asynccontextmanager
@@ -136,6 +187,7 @@ class LiveKitSignal:
 				ws=ws,
 				logger=logger,
 				task_group=task_group,
+				credential_metadata=read_credential_metadata(token),
 			)
 
 	def __aiter__(self) -> AsyncIterator[LiveKitSignalMessage]:
@@ -165,11 +217,15 @@ class LiveKitSignal:
 			compression=WrappedJoinRequest.GZIP,
 			join_request=gzip.compress(join_request.SerializeToString()),
 		)
-		return f"{url.rstrip('/')}/rtc?{urlencode({
-			'join_request': base64.urlsafe_b64encode(
-				wrapped_join_request.SerializeToString()
-			).decode(),
-		})}"
+		return f"{url.rstrip('/')}/rtc?{
+			urlencode(
+				{
+					'join_request': base64.urlsafe_b64encode(
+						wrapped_join_request.SerializeToString()
+					).decode(),
+				}
+			)
+		}"
 
 	async def messages(self) -> AsyncIterator[LiveKitSignalMessage]:
 		"""Yield parsed LiveKit SignalResponse messages."""
@@ -177,21 +233,21 @@ class LiveKitSignal:
 			if msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
 				break
 			if msg.type != WSMsgType.BINARY:
-				raise RuntimeError(
-					f"LiveKit sent non-binary signaling message type={msg.type}"
-				)
+				raise RuntimeError(f"LiveKit sent non-binary signaling message type={msg.type}")
 
 			try:
 				response = SignalResponse.FromString(msg.data)
 			except Exception as err:
-				self._logger.error("Error parsing LiveKit SignalResponse: %s", err)
+				self._logger.error("Error parsing LiveKit SignalResponse (%s)", type(err).__name__)
 				continue
 
 			yield self._response_message(response)
 
 	def _response_message(
-		self, response: SignalResponse,
+		self,
+		response: SignalResponse,
 	) -> LiveKitSignalMessage:
+		self._log_response_metadata(response)
 		match kind := response.WhichOneof("message"):
 			case "join":
 				self._start_ping(response.join.ping_interval)
@@ -216,10 +272,177 @@ class LiveKitSignal:
 				return kind, response.pong_resp
 			case _:
 				self._logger.debug(
-					"Unhandled LiveKit signaling response: %s",
-					response,
+					"Unhandled LiveKit signaling response kind=%s",
+					kind,
 				)
 				return "response", response
+
+	def _log_response_metadata(self, response: SignalResponse) -> None:
+		"""Log state transitions and counts, never protobufs, identifiers, or SDP."""
+		elapsed = round(time.monotonic() - self._started_at, 1)
+		kind = response.WhichOneof("message")
+		self._message_counts[kind] += 1
+		if kind == "join":
+			join = response.join
+			claims = self._credential_metadata
+			self._logger.info(
+				"LiveKit joined elapsed_s=%s ping_interval_s=%s ping_timeout_s=%s "
+				"subscriber_primary=%s claimed_room_matches=%s claimed_subject_matches=%s",
+				elapsed,
+				join.ping_interval,
+				join.ping_timeout,
+				join.subscriber_primary,
+				join.room.name == claims.room if claims.room is not None else None,
+				join.participant.identity == claims.subject if claims.subject is not None else None,
+			)
+			self._log_participants(join.other_participants, elapsed)
+		elif kind == "update":
+			self._log_participants(response.update.participants, elapsed)
+		elif kind == "subscription_permission_update":
+			allowed = response.subscription_permission_update.allowed
+			log = self._logger.info if allowed else self._logger.warning
+			log("LiveKit subscription permission elapsed_s=%s allowed=%s", elapsed, allowed)
+		elif kind == "subscription_response":
+			if response.subscription_response.err:
+				self._logger.warning(
+					"LiveKit subscription response elapsed_s=%s error_code=%s",
+					elapsed,
+					int(response.subscription_response.err),
+				)
+		elif kind == "stream_state_update":
+			states = sorted(
+				Counter(int(s.state) for s in response.stream_state_update.stream_states).items()
+			)
+			self._logger.info(
+				"LiveKit media stream states elapsed_s=%s state_counts=%s", elapsed, states
+			)
+		elif kind == "leave":
+			self._logger.warning(
+				"LiveKit leave elapsed_s=%s action_code=%s reason_code=%s can_reconnect=%s",
+				elapsed,
+				int(response.leave.action),
+				int(response.leave.reason),
+				response.leave.can_reconnect,
+			)
+		elif kind in {"room_moved", "refresh_token"}:
+			metadata = read_credential_metadata(
+				response.room_moved.token if kind == "room_moved" else response.refresh_token
+			)
+			claims = self._credential_metadata
+			self._logger.info(
+				"LiveKit credential/session event elapsed_s=%s kind=%s same_room=%s "
+				"same_subject=%s claimed_credential_lifetime_s=%s claimed_credential_expires_in_s=%s",
+				elapsed,
+				kind,
+				metadata.room == claims.room
+				if claims.room is not None and metadata.room is not None
+				else None,
+				metadata.subject == claims.subject
+				if claims.subject is not None and metadata.subject is not None
+				else None,
+				metadata.expires_at - metadata.issued_at
+				if metadata.expires_at is not None and metadata.issued_at is not None
+				else None,
+				metadata.expires_at - int(time.time()) if metadata.expires_at is not None else None,
+			)
+		elif kind in {"track_unpublished", "mute", "reconnect"}:
+			self._logger.info("LiveKit media/session event elapsed_s=%s kind=%s", elapsed, kind)
+		elif kind == "media_sections_requirement":
+			self._logger.info(
+				"LiveKit media sections required elapsed_s=%s audio_sections=%s video_sections=%s",
+				elapsed,
+				response.media_sections_requirement.num_audios,
+				response.media_sections_requirement.num_videos,
+			)
+		elif kind in {"offer", "answer"}:
+			sdp = getattr(response, kind).sdp
+			self._logger.info(
+				"LiveKit description elapsed_s=%s kind=%s audio_sections=%s video_sections=%s",
+				elapsed,
+				kind,
+				sum(line.startswith("m=audio ") for line in sdp.splitlines()),
+				sum(line.startswith("m=video ") for line in sdp.splitlines()),
+			)
+		elif kind in {"pong_resp", "pong"}:
+			self._pongs_received += 1
+			now = time.monotonic()
+			if self._last_pong_log_at is None or now - self._last_pong_log_at >= 60:
+				self._last_pong_log_at = now
+				self._logger.info(
+					"LiveKit signaling alive elapsed_s=%s pings_sent=%s pongs_received=%s",
+					elapsed,
+					self._pings_sent,
+					self._pongs_received,
+				)
+		else:
+			now = time.monotonic()
+			if kind not in self._kind_log_at or now - self._kind_log_at[kind] >= 60:
+				self._kind_log_at[kind] = now
+				self._logger.info(
+					"LiveKit response metadata elapsed_s=%s kind=%s count=%s",
+					elapsed,
+					kind,
+					self._message_counts[kind],
+				)
+
+	def _log_participants(self, participants: Iterable[ParticipantInfo], elapsed: float) -> None:
+		participants = list(participants)
+		before = sum(len(tracks) for tracks in self._camera_video_tracks.values())
+		tracks_changed = False
+		for participant in participants:
+			key = participant.sid or participant.identity
+			if not key:
+				continue
+			if participant.state == ParticipantInfo.DISCONNECTED:
+				tracks_changed |= bool(self._camera_video_tracks.get(key))
+				self._camera_video_tracks.pop(key, None)
+			else:
+				videos = {
+					track.sid
+					for track in participant.tracks
+					if track.type == VIDEO and track.source == CAMERA and track.sid
+				}
+				tracks_changed |= self._camera_video_tracks.get(key, set()) != videos
+				self._camera_video_tracks[key] = videos
+		after = sum(len(tracks) for tracks in self._camera_video_tracks.values())
+		self._camera_video_seen |= after > 0
+		states = sorted(Counter(int(p.state) for p in participants).items())
+		tracks = [track for participant in participants for track in participant.tracks]
+		videos = [track for track in tracks if track.type == VIDEO and track.source == CAMERA]
+		summary = (
+			states,
+			sum(p.is_publisher for p in participants),
+			sum(track.type == AUDIO and track.source == MICROPHONE for track in tracks),
+			len(videos),
+			sum(track.muted for track in videos),
+			after,
+		)
+		if summary != self._participant_summary or tracks_changed:
+			self._participant_summary = summary
+			self._logger.info(
+				"LiveKit participant update elapsed_s=%s state_counts=%s publishers=%s "
+				"updated_camera_audio=%s updated_camera_video=%s muted_camera_video=%s "
+				"active_camera_video=%s camera_video_tracks_changed=%s",
+				elapsed,
+				*summary,
+				tracks_changed,
+			)
+		if before > after:
+			reasons = sorted(
+				Counter(
+					int(p.disconnect_reason)
+					for p in participants
+					if p.state == ParticipantInfo.DISCONNECTED
+				).items()
+			)
+			self._logger.warning(
+				"LiveKit camera video tracks removed elapsed_s=%s removed=%s remaining=%s "
+				"disconnect_reason_counts=%s",
+				elapsed,
+				before - after,
+				after,
+				reasons,
+			)
 
 	async def send(self, request: SignalRequest) -> None:
 		"""Send a protobuf request on this websocket."""
@@ -229,9 +452,7 @@ class LiveKitSignal:
 
 	def _start_ping(self, interval_seconds: int) -> None:
 		if interval_seconds <= 0:
-			raise RuntimeError(
-				f"LiveKit join had invalid ping_interval={interval_seconds}"
-			)
+			raise RuntimeError(f"LiveKit join had invalid ping_interval={interval_seconds}")
 		if self._ping_task is not None:
 			return
 		self._ping_task = self._task_group.create_task(
@@ -243,13 +464,12 @@ class LiveKitSignal:
 		try:
 			while not self._ws.closed:
 				await asyncio.sleep(interval_seconds)
-				await self.send(
-					SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000)))
-				)
+				await self.send(SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000))))
+				self._pings_sent += 1
 		except asyncio.CancelledError:
 			raise
 		except Exception as err:
-			self._logger.error("LiveKit ping failed: %s", err)
+			self._logger.error("LiveKit ping failed (%s)", type(err).__name__)
 			raise
 		finally:
 			self._ping_task = None
@@ -267,23 +487,23 @@ class WarmupSession:
 		self._signal = signal
 		self._logger = _LOGGER.getChild("warmup")
 
-		self._peer_connection = RTCPeerConnection(configuration=RTCConfiguration(
-			iceServers=[
-				RTCIceServer(
-					urls=list(ice_server.urls),
-					username=ice_server.username or None,
-					credential=ice_server.credential or None,
-				)
-				for ice_server in ice_servers
-			],
-			bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
-		))
+		self._peer_connection = RTCPeerConnection(
+			configuration=RTCConfiguration(
+				iceServers=[
+					RTCIceServer(
+						urls=list(ice_server.urls),
+						username=ice_server.username or None,
+						credential=ice_server.credential or None,
+					)
+					for ice_server in ice_servers
+				],
+				bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
+			)
+		)
 		self._peer_connection.addTransceiver("audio", direction="recvonly")
 		self._peer_connection.addTransceiver("video", direction="recvonly")
 
-		self._waiting_for_track_permissions = set(
-			_CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values()
-		)
+		self._waiting_for_track_permissions = set(_CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values())
 		self._track_sid_by_kind: dict[str, str] = {}
 		self._allowed_track_sids: set[str] = set()
 
@@ -306,17 +526,15 @@ class WarmupSession:
 					case ("subscription_response", response):
 						if response.err:
 							self._logger.warning(
-								"LiveKit aiortc warmup subscription failed: track=%s error=%s",
-								response.track_sid,
+								"LiveKit aiortc warmup subscription failed: error_code=%s",
 								response.err,
 							)
 					case ("pong_resp", _):
 						pass
 					case (kind, response):
 						self._logger.debug(
-							"Unhandled LiveKit aiortc warmup message kind=%s response=%s",
+							"Unhandled LiveKit aiortc warmup message kind=%s",
 							kind,
-							response,
 						)
 
 				if not self._waiting_for_track_permissions:
@@ -370,9 +588,7 @@ class WarmupSession:
 		sdp_mid = init.get("sdpMid")
 		sdp_m_line_index = init.get("sdpMLineIndex")
 		candidate.sdpMid = sdp_mid if isinstance(sdp_mid, str) else None
-		candidate.sdpMLineIndex = (
-			sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
-		)
+		candidate.sdpMLineIndex = sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
 		await self._peer_connection.addIceCandidate(candidate)
 
 	def _on_participant_update(self, update: ParticipantUpdate) -> None:
@@ -382,9 +598,7 @@ class WarmupSession:
 			for track in participant.tracks:
 				if not track.sid:
 					continue
-				if track_kind := _CAMERA_TRACK_KIND_BY_TYPE_SOURCE.get(
-					(track.type, track.source)
-				):
+				if track_kind := _CAMERA_TRACK_KIND_BY_TYPE_SOURCE.get((track.type, track.source)):
 					self._track_sid_by_kind[track_kind] = track.sid
 					if track.sid in self._allowed_track_sids:
 						self._waiting_for_track_permissions.discard(track_kind)
@@ -410,6 +624,7 @@ class WarmupSession:
 				return track_kind
 		return None
 
+
 class LiveKitSession(SimpliSafeWebRTCSession):
 	"""A browser-offer LiveKit signaling session for Home Assistant."""
 
@@ -419,6 +634,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		livekit_url: str,
 		user_token: str,
 		send_ice_servers: SendIceServers,
+		stream_logger: logging.Logger | None = None,
 	) -> None:
 		self._livekit_url = livekit_url
 		self._user_token = user_token
@@ -426,11 +642,18 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		self._id = token_hex(4)
 		self._send_message: WebRTCSendMessage | None = None
 		self._on_close: SessionClosedCallback | None = None
-		self._logger = _LOGGER.getChild(f"session.{self._id}")
+		self._logger = (stream_logger or _LOGGER).getChild(f"session.{self._id}")
 
 		self._offer_sdp: str | None = None
+		self._started_at = time.monotonic()
 		self._reader_task: asyncio.Task[None] | None = None
 		self._request_queue = MessageQueue[SignalRequest]()
+		self._camera_video_ended = False
+
+	@property
+	def camera_video_ended(self) -> bool:
+		"""Return whether the camera publisher ended this browser's live view."""
+		return self._camera_video_ended
 
 	@override
 	def start(self, on_close: SessionClosedCallback) -> None:
@@ -444,8 +667,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 			try:
 				await self._read()
 			except Exception as err:
-				self._logger.error("Error in LiveKit session: %s", err)
+				self._logger.error("LiveKit signaling failed (%s)", type(err).__name__)
 			finally:
+				self._logger.info(
+					"LiveKit session ended elapsed_s=%s",
+					round(time.monotonic() - self._started_at, 1),
+				)
 				self._reader_task = None
 				self.close()
 
@@ -461,10 +688,14 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 			raise RuntimeError(f"LiveKit session {self._id} was not started")
 		self._send_message = send_message
 		self._offer_sdp = offer_sdp
-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
-			type="offer",
-			sdp=offer_sdp,
-		)))
+		await self._request_queue.add(
+			SignalRequest(
+				offer=SessionDescription(
+					type="offer",
+					sdp=offer_sdp,
+				)
+			)
+		)
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
@@ -480,12 +711,14 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		if candidate.sdp_m_line_index is not None:
 			candidate_init["sdpMLineIndex"] = candidate.sdp_m_line_index
 
-		await self._request_queue.add(SignalRequest(
-			trickle=TrickleRequest(
-				candidateInit=json.dumps(candidate_init, separators=(",", ":")),
-				target=SignalTarget.PUBLISHER,
-			),
-		))
+		await self._request_queue.add(
+			SignalRequest(
+				trickle=TrickleRequest(
+					candidateInit=json.dumps(candidate_init, separators=(",", ":")),
+					target=SignalTarget.PUBLISHER,
+				),
+			)
+		)
 
 	@override
 	def close(self) -> None:
@@ -524,8 +757,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 
 			if all(
 				any(
-					track.sid
-					and (track.type, track.source) == required_track
+					track.sid and (track.type, track.source) == required_track
 					for participant in join.other_participants
 					for track in participant.tracks
 				)
@@ -536,11 +768,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				return
 
 			try:
-				await WarmupSession(signal, ice_servers=ice_servers).run()
+				async with asyncio.timeout(20):
+					await WarmupSession(signal, ice_servers=ice_servers).run()
 			except Exception as err:
 				self._logger.warning(
-					"LiveKit aiortc warmup failed; continuing with browser offer: %s",
-					err,
+					"LiveKit aiortc warmup failed; continuing with browser offer (%s)",
+					type(err).__name__,
 				)
 
 		async with LiveKitSignal.connect(
@@ -564,6 +797,12 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 					self._on_trickle(trickle)
 				case ("media_sections_requirement", requirement):
 					await self._on_media_sections_requirement(requirement)
+				case ("update", _):
+					if signal.camera_video_ended:
+						self._camera_video_ended = True
+						self._logger.info("LiveKit camera video ended; closing browser signaling")
+						self.close()
+						return
 				case ("leave", leave):
 					self._logger.warning(
 						"LiveKit browser signal left: reason=%s",
@@ -572,17 +811,15 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				case ("subscription_response", response):
 					if response.err:
 						self._logger.warning(
-							"LiveKit browser subscription failed: track=%s error=%s",
-							response.track_sid,
+							"LiveKit browser subscription failed: error_code=%s",
 							response.err,
 						)
 				case ("pong_resp", _):
 					pass
 				case (kind, response):
 					self._logger.debug(
-						"Unhandled LiveKit browser message kind=%s response=%s",
+						"Unhandled LiveKit browser message kind=%s",
 						kind,
-						response,
 					)
 
 		if not self._request_queue.flushed:
@@ -598,11 +835,15 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 
 		if trickle.final and not trickle.candidateInit:
 			if send_message := self._send_message:
-				send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
-					candidate="",
-					sdp_mid=None,
-					sdp_m_line_index=None,
-				)))
+				send_message(
+					WebRTCCandidate(
+						candidate=RTCIceCandidateInit(
+							candidate="",
+							sdp_mid=None,
+							sdp_m_line_index=None,
+						)
+					)
+				)
 			return
 		if not trickle.candidateInit:
 			return
@@ -620,24 +861,34 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		sdp_mid = candidate_init.get("sdpMid")
 		sdp_m_line_index = candidate_init.get("sdpMLineIndex")
 		if send_message := self._send_message:
-			send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
-				candidate=candidate,
-				sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
-				sdp_m_line_index=(
-					sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
-				),
-			)))
+			send_message(
+				WebRTCCandidate(
+					candidate=RTCIceCandidateInit(
+						candidate=candidate,
+						sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
+						sdp_m_line_index=(
+							sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+						),
+					)
+				)
+			)
 
 	async def _on_media_sections_requirement(
 		self,
 		requirement: MediaSectionsRequirement,
 	) -> None:
 		if requirement.num_audios or requirement.num_videos:
-			self._logger.warning(f"LiveKit requested extra media sections audio={requirement.num_audios} video={requirement.num_videos}; Home Assistant cannot apply renegotiation")
+			self._logger.warning(
+				f"LiveKit requested extra media sections audio={requirement.num_audios} video={requirement.num_videos}; Home Assistant cannot apply renegotiation"
+			)
 		if self._offer_sdp is None:
 			self._logger.warning("LiveKit requested media sections before browser offer")
 			return
-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
-			type="offer",
-			sdp=self._offer_sdp,
-		)))
+		await self._request_queue.add(
+			SignalRequest(
+				offer=SessionDescription(
+					type="offer",
+					sdp=self._offer_sdp,
+				)
+			)
+		)

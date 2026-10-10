@@ -179,3 +179,19 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Private installation evidence and generated packages
+/validation/
+/dist/
+/test-results*.xml
+.env
+.env.*
+secrets.yaml
+configuration.yaml
+*.har
+*.token
+*auth*.json
+*token*.json
+*.log
+private/
+diagnostics/
+.simplisafe-streaming-backups/
