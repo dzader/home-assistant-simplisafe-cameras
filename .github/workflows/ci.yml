@@ -42,6 +42,18 @@ jobs:
           HA_VERSION: ${{ matrix.version }}
         run: |
           python -m pip install "homeassistant==$HA_VERSION" -r requirements-test.txt
-          python -c "import json,pathlib,homeassistant; custom=pathlib.Path('custom_components/simplirtc/manifest.json'); native=pathlib.Path(homeassistant.__file__).parent/'components/simplisafe/manifest.json'; dependencies=json.loads(custom.read_text())['requirements']+json.loads(native.read_text())['requirements']; pathlib.Path('runtime-requirements.txt').write_text('\n'.join(dependencies)+'\n')"
+          python - <<'PYDEPS'
+          import json
+          from pathlib import Path
+          import homeassistant
+
+          custom = Path("custom_components/simplirtc/manifest.json")
+          components = Path(homeassistant.__file__).parent / "components"
+          dependencies = json.loads(custom.read_text())["requirements"]
+          for integration in ("simplisafe", "camera", "stream", "ffmpeg", "go2rtc"):
+              manifest = json.loads((components / integration / "manifest.json").read_text())
+              dependencies.extend(manifest.get("requirements", []))
+          Path("runtime-requirements.txt").write_text("\n".join(dependencies) + "\n")
+          PYDEPS
           python -m pip install -r runtime-requirements.txt
       - run: python -m pytest tests --ignore=tests/tools -q
